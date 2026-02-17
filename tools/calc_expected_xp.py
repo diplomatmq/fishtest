@@ -21,8 +21,10 @@ from pathlib import Path
 
 # Change this ID to the target user
 USER_ID = 7855666356
-# chat_id used for lookups; set -1 to match global rows (code treats <1 as global)
-CHAT_ID = -1
+# chat_id used for lookups:
+# - set to -1 to match global rows (code treats <1 as global)
+# - set to None or 'ANY' to include caught_fish from all chats for the user
+CHAT_ID = None
 
 
 def ensure_project_on_path():
@@ -60,7 +62,36 @@ if __name__ == '__main__':
     print(f"Inspecting user: {USER_ID} (chat_id lookup: {CHAT_ID})\n")
 
     # Fetch all caught fish visible to the user (read-only)
-    caught = db.get_caught_fish(USER_ID, CHAT_ID)
+    # If CHAT_ID is None or 'ANY', fetch across all chats; otherwise use
+    # the project's `get_caught_fish` helper which applies chat-aware filtering.
+    if CHAT_ID is None or CHAT_ID == 'ANY':
+        with db._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT cf.*, 
+                       COALESCE(f.name, t.name) AS name,
+                       COALESCE(f.rarity, 'Мусор') AS rarity,
+                       COALESCE(f.price, t.price, 0) AS price,
+                       f.min_weight AS min_weight,
+                       f.max_weight AS max_weight,
+                       f.min_length AS min_length,
+                       f.max_length AS max_length,
+                       CASE WHEN f.name IS NULL THEN 1 ELSE 0 END AS is_trash
+                FROM caught_fish cf
+                LEFT JOIN fish f ON TRIM(cf.fish_name) = f.name
+                LEFT JOIN trash t ON TRIM(cf.fish_name) = t.name
+                WHERE cf.user_id = ?
+                ORDER BY cf.weight DESC
+            ''', (USER_ID,))
+            rows = cursor.fetchall()
+            cols = [d[0] for d in cursor.description]
+            caught = [dict(zip(cols, r)) for r in rows]
+            for item in caught:
+                if item.get('is_trash'):
+                    continue
+                item['price'] = db.calculate_fish_price(item, item.get('weight', 0), item.get('length', 0))
+    else:
+        caught = db.get_caught_fish(USER_ID, CHAT_ID)
     print(f"Total caught rows returned: {len(caught)}")
 
     # Partition into sold / unsold

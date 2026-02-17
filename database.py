@@ -48,26 +48,66 @@ class PostgresConnWrapper:
                 s = s.rstrip().rstrip(';') + ' ON CONFLICT DO NOTHING;'
 
         # translate INSERT OR REPLACE for common tables to Postgres upsert
-        import re
-        m = re.search(r"INSERT\s+OR\s+REPLACE\s+INTO\s+(\w+)\s*\(([^)]+)\)\s*VALUES\s*\(([^)]+)\)", s, re.IGNORECASE)
-        if m:
-            table = m.group(1)
-            cols = [c.strip() for c in m.group(2).split(',')]
-            vals = m.group(3)
-            # mapping of tables -> conflict target
-            conflict_map = {
-                'baits': 'name',
-                'fish': 'name',
-                'player_baits': 'user_id, bait_name',
-                'player_nets': 'user_id, net_name',
-                'player_rods': 'user_id, rod_name',
-                'chat_configs': 'chat_id',
-                'user_ref_links': 'user_id',
-            }
-            conflict_cols = conflict_map.get(table.lower())
-            if conflict_cols:
-                updates = ', '.join([f"{col} = EXCLUDED.{col}" for col in cols if col])
-                s = f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({vals}) ON CONFLICT ({conflict_cols}) DO UPDATE SET {updates};"
+        # Use a robust parser for matching parentheses instead of a fragile regex,
+        # because VALUES(...) can contain nested parentheses (e.g. COALESCE, SELECT).
+        try:
+            import re
+            m = re.search(r"INSERT\s+OR\s+REPLACE\s+INTO\s+(\w+)", s, re.IGNORECASE)
+            if m:
+                table = m.group(1)
+                # find the first '(' after the table name for columns
+                start_cols = s.find('(', m.end())
+                if start_cols != -1:
+                    # find matching ')' for cols
+                    depth = 0
+                    end_cols = None
+                    for idx in range(start_cols, len(s)):
+                        ch = s[idx]
+                        if ch == '(':
+                            depth += 1
+                        elif ch == ')':
+                            depth -= 1
+                            if depth == 0:
+                                end_cols = idx
+                                break
+                    if end_cols:
+                        cols_text = s[start_cols+1:end_cols]
+                        cols = [c.strip() for c in cols_text.split(',')]
+                        # Find VALUES keyword after end_cols
+                        vals_kw = re.search(r"VALUES\s*\(", s[end_cols:], re.IGNORECASE)
+                        if vals_kw:
+                            start_vals = end_cols + vals_kw.start() + s[end_cols+vals_kw.start():].find('(')
+                            # find matching ')' for vals, accounting for nesting
+                            depth = 0
+                            end_vals = None
+                            for idx in range(start_vals, len(s)):
+                                ch = s[idx]
+                                if ch == '(':
+                                    depth += 1
+                                elif ch == ')':
+                                    depth -= 1
+                                    if depth == 0:
+                                        end_vals = idx
+                                        break
+                            if end_vals:
+                                vals = s[start_vals+1:end_vals]
+                                # mapping of tables -> conflict target
+                                conflict_map = {
+                                    'baits': 'name',
+                                    'fish': 'name',
+                                    'player_baits': 'user_id, bait_name',
+                                    'player_nets': 'user_id, net_name',
+                                    'player_rods': 'user_id, rod_name',
+                                    'chat_configs': 'chat_id',
+                                    'user_ref_links': 'user_id',
+                                }
+                                conflict_cols = conflict_map.get(table.lower())
+                                if conflict_cols:
+                                    updates = ', '.join([f"{col} = EXCLUDED.{col}" for col in cols if col])
+                                    s = f"INSERT INTO {table} ({', '.join(cols)}) VALUES ({vals}) ON CONFLICT ({conflict_cols}) DO UPDATE SET {updates};"
+        except Exception:
+            # fallback to original behavior on any parse error
+            pass
         # psycopg2 uses Python %-format-style param interpolation; stray '%' in SQL
         # (e.g. LIKE '%Все%') will be treated as format specifiers and cause errors.
         # Preserve '%s' placeholders, escape other '%' by doubling them.
