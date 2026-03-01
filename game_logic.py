@@ -126,12 +126,29 @@ class FishingGame:
     
     def fish(self, user_id: int, chat_id: int, location: str = "Городской пруд", guaranteed: bool = False) -> Dict[str, Any]:
         """Основная функция ловли рыбы"""
+        # Проверка на арест рыбнадзором
+        player = db.get_player(user_id, chat_id)
+        if player and player.get('is_banned'):
+            ban_until = player.get('ban_until')
+            if ban_until:
+                now = datetime.now()
+                ban_time = datetime.fromisoformat(ban_until)
+                if now < ban_time:
+                    remaining = ban_time - now
+                    hours = int(remaining.total_seconds() // 3600)
+                    minutes = int((remaining.total_seconds() % 3600) // 60)
+                    return {
+                        "success": False,
+                        "message": f"⛔️ Вас арестовал рыбнадзор! До окончания ареста: {hours}ч {minutes}мин. Можно откупиться за 15 звезд командой /payfine"
+                    }
+                db.update_player(user_id, chat_id, is_banned=0, ban_until=None)
+
         # Проверка cooldown - не нужна для гарантированного улова (расплачено звездами)
         if not guaranteed:
             can_fish, message = self.can_fish(user_id, chat_id)
             if not can_fish:
                 return {"success": False, "message": message}
-        
+
         player = db.get_player(user_id, chat_id)
         if not player:
             return {
@@ -141,7 +158,7 @@ class FishingGame:
             }
         player_level = player.get('level', 0) or 0
         rod = db.get_rod(player['current_rod'])
-        
+
         # Получаем бонус от наживки
         current_bait = db.get_player_baits(user_id) or []
         bait_bonus = 0
@@ -149,24 +166,24 @@ class FishingGame:
             if bait['name'] == player['current_bait']:
                 bait_bonus = bait['fish_bonus']
                 break
-        
+
         # Обновляем сезон
         self.current_season = self._get_current_season()
-        
+
         # Если гарантированный улов
         if guaranteed:
             return self._guaranteed_catch(user_id, location, player, chat_id)
-        
+
         # Получаем погоду и применяем бонус
         weather = db.get_or_update_weather(location)
         weather_bonus = 0
         weather_condition = "Ясно"
-        
+
         if weather:
             weather_condition = weather['condition']
             weather_bonus = weather_system.get_weather_bonus(weather_condition)
             logger.info(f"   🌍 Weather: {weather_condition} (bonus: {weather_bonus:+d}%)")
-        
+
         # Единая механика для всех локаций: один бросок от 0 до 10000
         # 0-3000 = ничего не клюёт
         # 3001-6000 = мусор
@@ -175,10 +192,27 @@ class FishingGame:
         # 9701-9999 = легендарная
         # 10000 = NFT
         roll = random.randint(0, 10000)
-        
+
         # Применяем погодный бонус/штраф (уменьшенное влияние)
         adjusted_roll = roll + (weather_bonus * 50)
         adjusted_roll = max(0, min(10000, adjusted_roll))  # Ограничиваем от 0 до 10000
+
+        # --- ГАРПУН: спец.логика ---
+        if rod and rod['name'] == 'Гарпун':
+            # Ограничение: только рыба 150кг+ (и огромные)
+            # Найдём подходящую рыбу (если выпадет меньше - fail)
+            # Получаем список возможной рыбы для локации и сезона
+            fish_list = db.get_fish_for_location(location, self.current_season, player_level)
+            fish_list = [f for f in fish_list if f['min_weight'] >= 150]
+            if not fish_list:
+                return {"success": False, "message": "🐟 В этой локации нет рыбы для гарпуна!"}
+            # Симулируем обычный roll, но если выпала рыба < 150кг, fail
+            # (остальная логика ниже, но после выбора рыбы)
+            # ...existing code...
+            # После выбора рыбы:
+            # if caught_fish['weight'] < 150:
+            #     return {"success": False, "message": "Гарпун разорвал рыбу на две части 😢"}
+            # (реализация ниже в коде catch)
         
         logger.info(f"🎣 User {user_id} started fishing at location: {location}")
         logger.info(f"   🎲 Random roll: {roll}/10000 (adjusted: {adjusted_roll}/10000 with weather {weather_condition})")
@@ -376,7 +410,16 @@ class FishingGame:
         weight = round(random.uniform(caught_fish['min_weight'], caught_fish['max_weight']), 2)
         length = round(random.uniform(caught_fish['min_length'], caught_fish['max_length']), 1)
         logger.info(f"   📏 Fish stats: weight={weight}kg, length={length}cm")
-        
+
+        # --- ГАРПУН: если пойманная рыба < 150кг, fail ---
+        if rod and rod['name'] == 'Гарпун' and weight < 150:
+            db.update_player(user_id, chat_id, last_fish_time=datetime.now().isoformat())
+            return {
+                "success": False,
+                "message": "Гарпун разорвал рыбу на две части 😢",
+                "location": location
+            }
+
         # Проверка на превышение веса - рыба срывается если слишком тяжелая
         max_rod_weight = rod.get('max_weight', 999)
         if weight > max_rod_weight:
@@ -386,8 +429,20 @@ class FishingGame:
                 "message": f"Рыба {caught_fish['name']} ({weight}кг) слишком тяжелая для вашей удочки и сорвалась!",
                 "location": location
             }
-        
+
         # Успешная ловля - рыба больше не продается автоматически
+
+        # ===== МЕХАНИКА РЫБНАДЗОРА =====
+        fish_inspector_chance = 0.01  # 1% шанс
+        if random.random() < fish_inspector_chance:
+            ban_hours = 1
+            ban_until = (datetime.now() + timedelta(hours=ban_hours)).isoformat()
+            db.update_player(user_id, chat_id, is_banned=1, ban_until=ban_until)
+            return {
+                "success": False,
+                "fish_inspector": True,
+                "message": f"🚨 Вас поймал рыбнадзор! Ваш улов конфискован, а вы арестованы на {ban_hours} час. Можно откупиться за 15 звезд командой /payfine"
+            }
         
         # Применяем урон прочности удочки в зависимости от редкости рыбы
         damage = self.get_durability_damage(caught_fish['rarity'], is_guaranteed=False)

@@ -17,7 +17,7 @@ def get_button_style(text: str) -> str:
     if any(x in text_lower for x in ["нет", "отмена", "отклон", "cancel", "no", "decline"]):
         return "destructive"
     return None
-from telegram.error import BadRequest, RetryAfter
+from telegram.error import BadRequest, RetryAfter, TimedOut, NetworkError, Conflict
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, PreCheckoutQueryHandler, filters, ContextTypes, Defaults, ExtBot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -31,13 +31,52 @@ if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
-sys.stdout.write("[bot.py] Module loading started\n")
-sys.stdout.flush()
 
 # Добавляем текущую директорию в путь для поиска модулей
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from database import db, DB_PATH, BAMBOO_ROD, TEMP_ROD_RANGES
+
+# --- TelegramBotAPI for invoice link creation ---
+import httpx
+from typing import Any, Optional, Dict
+
+class TelegramBotAPI:
+    def __init__(self, bot_token: str) -> None:
+        self.bot_token = bot_token
+        self.base_url = f"https://api.telegram.org/bot{bot_token}"
+
+    async def create_invoice_link(self, **kwargs: Any) -> Optional[str]:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"[INVOICE] CALL create_invoice_link with kwargs: {kwargs}")
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{self.base_url}/createInvoiceLink",
+                    json=kwargs,
+                    timeout=10
+                )
+            logger.info(f"[INVOICE] Telegram API status: {response.status_code}")
+            logger.info(f"[INVOICE] Telegram API response: {response.text}")
+            if response.status_code == 200:
+                try:
+                    result = response.json()
+                except Exception as e:
+                    logger.error(f"[INVOICE] Failed to parse JSON: {e}, text: {response.text}")
+                    return None
+                if result.get("ok"):
+                    logger.info(f"[INVOICE] Got invoice_url: {result.get('result')}")
+                    return result.get("result")
+                else:
+                    logger.error(f"[INVOICE] Telegram API error: {result.get('description')}, full response: {response.text}")
+                    return None
+            else:
+                logger.error(f"[INVOICE] HTTP error: {response.status_code}, text: {response.text}")
+                return None
+        except Exception as e:
+            logger.error(f"[INVOICE] Exception in create_invoice_link: {e}")
+            return None
 from game_logic import game
 from config import BOT_TOKEN, COIN_NAME, STAR_NAME, GUARANTEED_CATCH_COST, get_current_season, RULES_TEXT, RULES_LINK, INFO_LINK
 import notifications
@@ -92,15 +131,59 @@ def replace_coin_emoji(text: str) -> str:
 
 
 class EmojiBot(ExtBot):
+    API_CALL_TIMEOUT = float(os.getenv('TG_API_CALL_TIMEOUT', '20'))
+    API_CALL_RETRIES = int(os.getenv('TG_API_CALL_RETRIES', '1'))
+    RETRY_BACKOFF_SEC = float(os.getenv('TG_API_RETRY_BACKOFF', '1.5'))
+
+    async def _call_with_timeout(self, method_name: str, coro_factory):
+        last_exc = None
+        for attempt in range(self.API_CALL_RETRIES + 1):
+            try:
+                return await asyncio.wait_for(coro_factory(), timeout=self.API_CALL_TIMEOUT)
+            except RetryAfter as exc:
+                last_exc = exc
+                wait = float(getattr(exc, 'retry_after', 1) or 1)
+                logger.warning("EmojiBot.%s flood limit, waiting %.2fs (attempt %s/%s)", method_name, wait, attempt + 1, self.API_CALL_RETRIES + 1)
+                await asyncio.sleep(wait + 1)
+            except BadRequest as exc:
+                # Ошибки Telegram API (например, Chat not found) не лечатся retry'ем
+                logger.warning("EmojiBot.%s bad request: %s", method_name, exc)
+                raise
+            except (TimedOut, NetworkError, asyncio.TimeoutError) as exc:
+                last_exc = exc
+                if attempt < self.API_CALL_RETRIES:
+                    backoff = self.RETRY_BACKOFF_SEC * (attempt + 1)
+                    logger.warning("EmojiBot.%s timeout/network error (%s), retry in %.2fs (attempt %s/%s)", method_name, type(exc).__name__, backoff, attempt + 1, self.API_CALL_RETRIES + 1)
+                    await asyncio.sleep(backoff)
+                    continue
+                logger.error("EmojiBot.%s failed after retries due to timeout/network error: %s", method_name, exc)
+                raise
+            except Exception as exc:
+                # Не скрываем неизвестные ошибки логики Telegram API
+                logger.error("EmojiBot.%s unexpected error: %s", method_name, exc)
+                raise
+
+        if last_exc is not None:
+            raise last_exc
+
     async def send_message(self, *args, **kwargs):
         if 'text' in kwargs:
             kwargs['text'] = replace_coin_emoji(kwargs['text'])
-        return await super().send_message(*args, **kwargs)
+        return await self._call_with_timeout("send_message", lambda: super(EmojiBot, self).send_message(*args, **kwargs))
 
     async def edit_message_text(self, *args, **kwargs):
         if 'text' in kwargs:
             kwargs['text'] = replace_coin_emoji(kwargs['text'])
-        return await super().edit_message_text(*args, **kwargs)
+        return await self._call_with_timeout("edit_message_text", lambda: super(EmojiBot, self).edit_message_text(*args, **kwargs))
+
+    async def send_document(self, *args, **kwargs):
+        return await self._call_with_timeout("send_document", lambda: super(EmojiBot, self).send_document(*args, **kwargs))
+
+    async def send_invoice(self, *args, **kwargs):
+        return await self._call_with_timeout("send_invoice", lambda: super(EmojiBot, self).send_invoice(*args, **kwargs))
+
+    async def get_chat(self, *args, **kwargs):
+        return await self._call_with_timeout("get_chat", lambda: super(EmojiBot, self).get_chat(*args, **kwargs))
 
 def format_level_progress(level_info):
     if not level_info:
@@ -143,12 +226,414 @@ def format_fish_name(name: str) -> str:
     return f"{random.choice(FISH_EMOJI_TAGS)} {name}"
 
 class FishBot:
+    async def ref_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /ref: показать статистику и обработать вывод звёзд"""
+        user_id = update.effective_user.id
+        # Получаем разрешённые чаты для пользователя
+        allowed_chats = db.get_ref_access_chats(user_id)
+        if not allowed_chats:
+            await update.message.reply_text("Нет разрешённых чатов для просмотра дохода.")
+            return
+        # Собираем статистику по каждому чату
+        lines = []
+        for ref_chat_id in allowed_chats:
+            chat_title = db.get_chat_title(ref_chat_id) or f"Чат {ref_chat_id}"
+            stars_total = db.get_chat_stars_total(ref_chat_id)
+            refunds_total = db.get_chat_refunds_total(ref_chat_id)
+            percent_sum = int((stars_total * 0.85) / 2)
+            available_stars = db.get_available_stars_for_withdraw(user_id, ref_chat_id)
+            withdrawn_stars = db.get_withdrawn_stars(user_id, ref_chat_id)
+            lines.append(
+                f"{chat_title}\nВсего звёзд: {stars_total}\nРефаунды: {refunds_total}\nВаш процент: {percent_sum}\nДоступно к выводу: {available_stars}\nУже выведено: {withdrawn_stars}"
+            )
+        keyboard = [[InlineKeyboardButton("💸 Вывод", callback_data=f"withdraw_stars_{user_id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("\n\n".join(lines), reply_markup=reply_markup)
+
+    async def handle_withdraw_stars_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка нажатия на кнопку вывода звёзд"""
+        query = update.callback_query
+        await query.answer()
+        context.user_data['waiting_withdraw_stars'] = True
+        await query.message.reply_text("Введите количество звёзд для вывода:")
+
+    async def handle_withdraw_stars_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка ввода количества звёзд для вывода"""
+        if not context.user_data.get('waiting_withdraw_stars'):
+            return
+        user_id = update.effective_user.id
+        try:
+            amount = int(update.message.text.strip())
+        except Exception:
+            await update.message.reply_text("Ошибка: введите число.")
+            return
+
+        allowed_chats = db.get_ref_access_chats(user_id)
+        available_stars = sum(db.get_available_stars_for_withdraw(user_id, chat_id) for chat_id in allowed_chats)
+        if amount < 1000:
+            await update.message.reply_text("Ошибка: минимальный вывод 1000 звёзд.")
+            return
+        if amount > available_stars:
+            await update.message.reply_text("Ошибка: недостаточно звёзд для вывода.")
+            return
+
+        admin_id = 793216884
+        await self.application.bot.send_message(
+            chat_id=admin_id,
+            text=(
+                f"Пользователь {user_id} запросил вывод {amount} звёзд.\n"
+                f"Доступно: {available_stars}.\n"
+                f"Одобрить?"
+            ),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Одобрено", callback_data=f"approve_withdraw_{user_id}_{amount}")]
+            ])
+        )
+        await update.message.reply_text("Запрос отправлен на одобрение админу.")
+        context.user_data.pop('waiting_withdraw_stars', None)
+
+    async def handle_approve_withdraw_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка одобрения вывода звёзд админом"""
+        query = update.callback_query
+        admin_id = 793216884
+        if update.effective_user.id != admin_id:
+            await query.answer("Нет доступа", show_alert=True)
+            return
+        parts = query.data.split('_')
+        if len(parts) != 4:
+            await query.answer("Ошибка данных", show_alert=True)
+            return
+        _, _, user_id, amount = parts
+        user_id = int(user_id)
+        amount = int(amount)
+        db.mark_stars_withdrawn(user_id, amount)
+        await query.answer("Одобрено!")
+        await self.application.bot.send_message(
+            chat_id=user_id,
+            text=f"✅ Ваш вывод {amount} звёзд одобрен и обработан!"
+        )
+
+    async def new_ref_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда /new_ref: добавить реферала с доступом к доходу чата по ссылке"""
+        user_id = update.effective_user.id
+        if not self._is_owner(user_id):
+            await update.message.reply_text("Команда доступна только владельцу бота.")
+            return
+
+        await update.message.reply_text(
+            "Введите ID пользователя, которому дать доступ, и ссылку на чат (через пробел):\n"
+            "Пример: 123456789 https://t.me/joinchat/AAAAAE2v..."
+        )
+        context.user_data['waiting_new_ref'] = True
+
+    async def handle_new_ref_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка ввода для /new_ref"""
+        if not context.user_data.get('waiting_new_ref'):
+            return
+        text = update.message.text.strip()
+        parts = text.split()
+        if len(parts) != 2:
+            await update.message.reply_text("Ошибка: введите ID и ссылку через пробел.")
+            return
+        ref_user_id, chat_link = parts
+        chat_id = None
+        m = re.search(r'-?\d{9,}', chat_link)
+        if m:
+            chat_id = int(m.group(0))
+        else:
+            await update.message.reply_text("Не удалось извлечь chat_id из ссылки. Проверьте формат.")
+            return
+        try:
+            db.add_ref_access(int(ref_user_id), chat_id)
+            await update.message.reply_text(f"✅ Доступ для пользователя {ref_user_id} к чату {chat_id} сохранён.")
+        except Exception as e:
+            await update.message.reply_text(f"Ошибка при сохранении: {e}")
+        context.user_data.pop('waiting_new_ref', None)
+
+    async def new_tour_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Создание турнира: выбор типа и ввод параметров."""
+        user_id = update.effective_user.id
+        if not self._is_owner(user_id):
+            await update.message.reply_text("Команда доступна только владельцу бота.")
+            return
+
+        context.user_data['new_tour'] = {
+            'chat_id': update.effective_chat.id,
+            'created_by': user_id,
+            'step': 'type',
+        }
+
+        keyboard = [
+            [InlineKeyboardButton(self.TOUR_TYPES['longest_fish'], callback_data='tour_type_longest_fish')],
+            [InlineKeyboardButton(self.TOUR_TYPES['biggest_weight'], callback_data='tour_type_biggest_weight')],
+            [InlineKeyboardButton(self.TOUR_TYPES['total_weight'], callback_data='tour_type_total_weight')],
+            [InlineKeyboardButton(self.TOUR_TYPES['specific_fish'], callback_data='tour_type_specific_fish')],
+        ]
+        await update.message.reply_text("Выберите тип турнира:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    async def handle_tour_type_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Выбор типа турнира через inline-кнопки."""
+        query = update.callback_query
+        await query.answer()
+
+        if not self._is_owner(update.effective_user.id):
+            await query.answer("Нет доступа", show_alert=True)
+            return
+
+        draft = context.user_data.get('new_tour')
+        if not draft:
+            await query.edit_message_text("Сессия создания турнира не найдена. Запустите /new_tour заново.")
+            return
+
+        selected_type = query.data.replace('tour_type_', '').strip()
+        if selected_type not in self.TOUR_TYPES:
+            await query.answer("Неизвестный тип", show_alert=True)
+            return
+
+        draft['tournament_type'] = selected_type
+        if selected_type == 'specific_fish':
+            draft['step'] = 'target_fish'
+            context.user_data['new_tour'] = draft
+            await query.edit_message_text(
+                f"Выбран тип: {self.TOUR_TYPES[selected_type]}\n\nВведите название рыбы (точно как в игре):"
+            )
+            return
+
+        draft['step'] = 'title'
+        context.user_data['new_tour'] = draft
+        await query.edit_message_text(
+            f"Выбран тип: {self.TOUR_TYPES[selected_type]}\n\nВведите название турнира:"
+        )
+
+    async def handle_new_tour_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        """Пошаговый ввод параметров для нового турнира."""
+        draft = context.user_data.get('new_tour')
+        if not draft:
+            return False
+
+        if not self._is_owner(update.effective_user.id):
+            context.user_data.pop('new_tour', None)
+            return False
+
+        message = update.effective_message
+        if not message or not message.text:
+            return True
+
+        text = message.text.strip()
+        step = draft.get('step')
+
+        if step == 'target_fish':
+            if len(text) < 2:
+                await update.message.reply_text("Название рыбы слишком короткое. Введите снова:")
+                return True
+            draft['target_fish'] = text
+            draft['step'] = 'title'
+            context.user_data['new_tour'] = draft
+            await update.message.reply_text("Введите название турнира:")
+            return True
+
+        if step == 'title':
+            draft['title'] = text[:120]
+            draft['step'] = 'starts_at'
+            context.user_data['new_tour'] = draft
+            await update.message.reply_text(
+                "Введите дату/время начала\n"
+                "Формат: ДД.ММ.ГГГГ ЧЧ:ММ\n"
+                "или: YYYY-MM-DD HH:MM"
+            )
+            return True
+
+        if step == 'starts_at':
+            starts_at = self._parse_datetime_input(text)
+            if not starts_at:
+                await update.message.reply_text("Неверный формат даты. Пример: 05.03.2026 19:30")
+                return True
+            draft['starts_at'] = starts_at
+            draft['step'] = 'ends_at'
+            context.user_data['new_tour'] = draft
+            await update.message.reply_text("Введите дату/время окончания в том же формате:")
+            return True
+
+        if step == 'ends_at':
+            ends_at = self._parse_datetime_input(text)
+            if not ends_at:
+                await update.message.reply_text("Неверный формат даты. Пример: 06.03.2026 19:30")
+                return True
+
+            starts_at = draft.get('starts_at')
+            if not starts_at or ends_at <= starts_at:
+                await update.message.reply_text("Дата окончания должна быть позже даты начала.")
+                return True
+
+            tournament_id = db.create_tournament(
+                chat_id=int(draft['chat_id']),
+                created_by=int(draft['created_by']),
+                title=draft.get('title') or 'Турнир',
+                tournament_type=draft.get('tournament_type'),
+                starts_at=starts_at,
+                ends_at=ends_at,
+                target_fish=draft.get('target_fish')
+            )
+
+            if tournament_id:
+                created = db.get_tournament(tournament_id) or {}
+                t_type = created.get('tournament_type') or draft.get('tournament_type')
+                t_type_name = self.TOUR_TYPES.get(t_type, t_type)
+                fish_line = ""
+                fish_name = created.get('target_fish') or draft.get('target_fish')
+                if fish_name:
+                    fish_line = f"\n🎯 Рыба: {fish_name}"
+                await update.message.reply_text(
+                    f"✅ Турнир создан (ID: {tournament_id})\n"
+                    f"🏆 {created.get('title') or draft.get('title')}\n"
+                    f"📌 Тип: {t_type_name}{fish_line}\n"
+                    f"🕒 {starts_at.strftime('%d.%m.%Y %H:%M')} — {ends_at.strftime('%d.%m.%Y %H:%M')}"
+                )
+            else:
+                await update.message.reply_text("❌ Не удалось создать турнир.")
+
+            context.user_data.pop('new_tour', None)
+            return True
+
+        return False
+
+    async def send_invoice_url_button(self, chat_id, invoice_url, text, user_id=None, invoice_id=None, timeout_sec=60):
+        """Отправить кнопку оплаты со ссылкой инвойса, с автоотключением."""
+        logger.info(f"[INVOICE] Sending invoice button to chat_id={chat_id}, url={invoice_url}, user_id={user_id}, invoice_id={invoice_id}")
+        if user_id is None:
+            raise ValueError("user_id обязателен для send_invoice_url_button")
+        if invoice_id is None:
+            invoice_id = f"{user_id}_{int(datetime.now().timestamp())}"
+        keyboard = [[InlineKeyboardButton(
+            "💳 Оплатить Telegram Stars",
+            url=invoice_url
+        )]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        msg = await self.application.bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+        # Сохраняем активный инвойс для пользователя
+        self.active_invoices[user_id] = {
+            'invoice_url': invoice_url,
+            'group_chat_id': chat_id,
+            'group_message_id': msg.message_id,
+            'invoice_id': invoice_id,
+            'created_at': datetime.now(),
+        }
+        # Ставим таймаут на отключение кнопки
+        await self.schedule_timeout(chat_id, msg.message_id, "⏰ Срок действия этого инвойса истек", timeout_seconds=timeout_sec)
+
+    def _build_guaranteed_payload(self, user_id: int, chat_id: int) -> str:
+        return f"guaranteed_{user_id}_{chat_id}_{int(datetime.now().timestamp())}"
+
+    def _parse_guaranteed_payload(self, payload: str) -> Optional[Dict[str, Any]]:
+        if not payload or not payload.startswith("guaranteed_"):
+            return None
+
+        body = payload[len("guaranteed_"):]
+        parts = body.rsplit("_", 2)
+        if len(parts) != 3:
+            return None
+
+        first_part, chat_part, ts_part = parts
+
+        try:
+            group_chat_id = int(chat_part)
+            created_ts = int(ts_part)
+        except (TypeError, ValueError):
+            return None
+
+        payload_user_id = None
+        location = None
+        try:
+            payload_user_id = int(first_part)
+        except (TypeError, ValueError):
+            location = first_part
+
+        return {
+            "payload_user_id": payload_user_id,
+            "group_chat_id": group_chat_id,
+            "created_ts": created_ts,
+            "location": location,
+        }
+
+    async def _create_guaranteed_invoice_url(self, user_id: int, chat_id: int) -> Optional[str]:
+        """Создать ссылку инвойса для гарантированного улова."""
+        from config import BOT_TOKEN, STAR_NAME
+
+        tg_api = TelegramBotAPI(BOT_TOKEN)
+        return await tg_api.create_invoice_link(
+            title="Гарантированный улов",
+            description=f"Гарантированный улов — подтвердите оплату (1 {STAR_NAME})",
+            payload=self._build_guaranteed_payload(user_id, chat_id),
+            currency="XTR",
+            prices=[{"label": "Вход", "amount": 1}],
+        )
+
+    async def _build_guaranteed_invoice_markup(self, user_id: int, chat_id: int) -> Optional[InlineKeyboardMarkup]:
+        """Собрать inline-кнопку со ссылкой на оплату гарантированного улова."""
+        try:
+            invoice_url = await self._create_guaranteed_invoice_url(user_id, chat_id)
+        except Exception as e:
+            logger.error(f"[INVOICE] Failed to create guaranteed invoice link: {e}")
+            return None
+
+        if not invoice_url:
+            return None
+
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"⭐ Оплатить {GUARANTEED_CATCH_COST} Telegram Stars", url=invoice_url)]
+        ])
+
+    async def handle_pay_invoice_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        user_id = update.effective_user.id
+        data = query.data.split(":")
+        if len(data) != 3:
+            await query.answer("Некорректная кнопка", show_alert=True)
+            return
+        _, owner_id, invoice_id = data
+        if str(user_id) != owner_id:
+            await query.answer("Эта кнопка только для вас!", show_alert=True)
+            return
+        # Проверяем, что инвойс ещё активен
+        invoice_info = self.active_invoices.get(int(owner_id))
+        if not invoice_info or invoice_info.get('invoice_id') != invoice_id:
+            await query.answer("Инвойс уже неактивен", show_alert=True)
+            return
+        # Открываем ссылку на оплату (отправляем url в чат)
+        invoice_url = invoice_info['invoice_url']
+        await query.answer()
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(f"Откройте ссылку для оплаты: {invoice_url}")
+        # После оплаты (или сразу) можно убрать инвойс из активных
+        del self.active_invoices[int(owner_id)]
+
     def __init__(self):
         self.scheduler = None  # Будет создан в main() с asyncio loop
         self.user_locations = {}  # Временное хранение локаций пользователей
         self.active_timeouts = {}  # Отслеживание активных таймеров
         self.active_invoices = {}  # Отслеживание активных инвойсов по пользователям
         self.application = None  # Будет установлено в main()
+        self.OWNER_ID = 793216884
+        self.TOUR_TYPES = {
+            'longest_fish': 'Самая длинная рыба',
+            'biggest_weight': 'Самая большая рыба (вес)',
+            'total_weight': 'Общий вес улова',
+            'specific_fish': 'Улов определённой рыбы',
+        }
+
+    def _is_owner(self, user_id: int) -> bool:
+        return int(user_id) == self.OWNER_ID
+
+    def _parse_datetime_input(self, raw_text: str) -> Optional[datetime]:
+        value = (raw_text or '').strip()
+        if not value:
+            return None
+        for fmt in ('%d.%m.%Y %H:%M', '%Y-%m-%d %H:%M'):
+            try:
+                return datetime.strptime(value, fmt)
+            except Exception:
+                continue
+        return None
 
     # --- Safe API wrappers to handle Flood control (RetryAfter) ---
     async def _safe_send_message(self, **kwargs):
@@ -434,7 +919,24 @@ class FishBot:
 
             lines = []
             for r in rows:
-                title = r.get('chat_title') or f"chat {r.get('chat_id')}"
+                chat_id = r.get('chat_id')
+                title = (r.get('chat_title') or '').strip()
+
+                if not title and chat_id:
+                    try:
+                        chat_obj = await self.application.bot.get_chat(chat_id)
+                        title = getattr(chat_obj, 'title', None) or ""
+                        if title:
+                            try:
+                                db.update_chat_title(chat_id, title)
+                            except Exception:
+                                pass
+                    except Exception:
+                        title = ""
+
+                if not title:
+                    title = f"chat:{chat_id}"
+
                 lines.append(f"{title} - {r.get('stars_total', 0)} ⭐")
 
             await update.message.reply_text("\n".join(lines))
@@ -476,23 +978,37 @@ class FishBot:
         # Проверяем кулдаун
         can_fish, message = game.can_fish(user_id, chat_id)
         if not can_fish:
-            # Отправляем сообщение с причиной и кнопкой оплаты
-            keyboard = [
-                [InlineKeyboardButton(
-                    f"⭐ Оплатить {GUARANTEED_CATCH_COST} Telegram Stars", 
-                    callback_data=f"pay_telegram_star_{user_id}_{player['current_location']}"
-                )]
-            ]
-            
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
+            # При неудаче сразу создаём invoice_url и кнопку с прямой ссылкой
+            from config import BOT_TOKEN, STAR_NAME
+            import traceback
+            invoice_error = None
             try:
-                await update.message.reply_text(
-                    f"⏰ {message}", 
-                    reply_markup=reply_markup
+                from bot import TelegramBotAPI as _TelegramBotAPI
+                tg_api = _TelegramBotAPI(BOT_TOKEN)
+                invoice_url = await tg_api.create_invoice_link(
+                    title=f"Гарантированный улов",
+                    description=f"Гарантированный улов — подтвердите оплату (1 {STAR_NAME})",
+                    payload=f"guaranteed_{user_id}_{chat_id}_{int(datetime.now().timestamp())}",
+                    currency="XTR",
+                    prices=[{"label": f"Вход", "amount": 1}]
                 )
+                logger.info(f"[INVOICE] Got invoice_url: {invoice_url}")
             except Exception as e:
-                logger.error(f"Error replying to fish command: {e}")
+                logger.error(f"[INVOICE] Failed to get invoice_url: {e}")
+                invoice_url = None
+                invoice_error = str(e) + "\n" + traceback.format_exc()
+            if invoice_url:
+                await self.send_invoice_url_button(
+                    chat_id=chat_id,
+                    invoice_url=invoice_url,
+                    text=f"⏰ {message}\n\n⭐ Оплатите 1 Telegram Stars для гарантированного улова на локации: {player['current_location']}",
+                    user_id=user_id
+                )
+            else:
+                error_text = f"⏰ {message}\n\n(Ошибка генерации ссылки для оплаты)"
+                if invoice_error:
+                    error_text += f"\nОшибка: {invoice_error}"
+                await update.message.reply_text(error_text, parse_mode=None)
             return
         
         # Начинаем рыбалку на текущей локации
@@ -553,11 +1069,12 @@ class FishBot:
                     try:
                         trash_image = TRASH_STICKERS[trash['name']]
                         image_path = Path(__file__).parent / trash_image
-                        sticker_message = await self.application.bot.send_document(
-                            chat_id=update.effective_chat.id,
-                            document=open(image_path, 'rb'),
-                            reply_to_message_id=update.message.message_id
-                        )
+                        with open(image_path, 'rb') as f:
+                            sticker_message = await self.application.bot.send_document(
+                                chat_id=update.effective_chat.id,
+                                document=f,
+                                reply_to_message_id=update.message.message_id
+                            )
                         if sticker_message:
                             context.bot_data.setdefault("last_bot_stickers", {})[update.effective_chat.id] = sticker_message.message_id
                     except Exception as e:
@@ -620,11 +1137,12 @@ class FishBot:
                 try:
                     fish_image = FISH_STICKERS[fish['name']]
                     image_path = Path(__file__).parent / fish_image
-                    sticker_message = await self.application.bot.send_document(
-                        chat_id=update.effective_chat.id,
-                        document=open(image_path, 'rb'),
-                        reply_to_message_id=update.message.message_id
-                    )
+                    with open(image_path, 'rb') as f:
+                        sticker_message = await self.application.bot.send_document(
+                            chat_id=update.effective_chat.id,
+                            document=f,
+                            reply_to_message_id=update.message.message_id
+                        )
                     if sticker_message:
                         context.bot_data.setdefault("last_bot_stickers", {})[update.effective_chat.id] = sticker_message.message_id
                         context.bot_data.setdefault("sticker_fish_map", {})[sticker_message.message_id] = {
@@ -697,10 +1215,11 @@ class FishBot:
                     try:
                         trash_image = TRASH_STICKERS[result['trash']['name']]
                         image_path = Path(__file__).parent / trash_image
-                        sticker_message = await self.application.bot.send_document(
-                            chat_id=update.effective_chat.id,
-                            document=open(image_path, 'rb')
-                        )
+                        with open(image_path, 'rb') as f:
+                            sticker_message = await self.application.bot.send_document(
+                                chat_id=update.effective_chat.id,
+                                document=f
+                            )
                         if sticker_message:
                             context.bot_data.setdefault("last_bot_stickers", {})[update.effective_chat.id] = sticker_message.message_id
                     except Exception as e:
@@ -714,34 +1233,43 @@ class FishBot:
                     )
                 return
             elif result.get('no_bite'):
-                # Отправляем сообщение с причиной и кнопкой оплаты
-                keyboard = [
-                    [InlineKeyboardButton(
-                        f"⭐ Оплатить {GUARANTEED_CATCH_COST} Telegram Stars", 
-                        callback_data=f"pay_telegram_star_{user_id}_{result['location']}"
-                    )]
-                ]
-                
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                await update.message.reply_text(
-                    f"😔 {result['message']}", 
-                    reply_markup=reply_markup
-                )
+                # При no_bite также создаём invoice_url и кнопку
+                from config import BOT_TOKEN, STAR_NAME
+                import traceback
+                invoice_error = None
+                try:
+                    from bot import TelegramBotAPI as _TelegramBotAPI
+                    tg_api = _TelegramBotAPI(BOT_TOKEN)
+                    invoice_url = await tg_api.create_invoice_link(
+                        title=f"Гарантированный улов",
+                        description=f"Гарантированный улов — подтвердите оплату (1 {STAR_NAME})",
+                        payload=f"guaranteed_{user_id}_{chat_id}_{int(datetime.now().timestamp())}",
+                        currency="XTR",
+                        prices=[{"label": f"Вход", "amount": 1}]
+                    )
+                    logger.info(f"[INVOICE] Got invoice_url: {invoice_url}")
+                except Exception as e:
+                    logger.error(f"[INVOICE] Failed to get invoice_url: {e}")
+                    invoice_url = None
+                    invoice_error = str(e) + "\n" + traceback.format_exc()
+                if invoice_url:
+                    await self.send_invoice_url_button(
+                        chat_id=chat_id,
+                        invoice_url=invoice_url,
+                        text=f"😔 {result['message']}\n\n⭐ Оплатите 1 Telegram Stars для гарантированного улова на локации: {result['location']}",
+                        user_id=user_id
+                    )
+                else:
+                    error_text = f"😔 {result['message']}\n\n(Ошибка генерации ссылки для оплаты)"
+                    if invoice_error:
+                        error_text += f"\nОшибка: {invoice_error}"
+                    await update.message.reply_text(error_text, parse_mode=None)
                 return
             else:
                 # Отправляем сообщение с причиной и кнопкой оплаты
-                keyboard = [
-                    [InlineKeyboardButton(
-                        f"⭐ Оплатить {GUARANTEED_CATCH_COST} Telegram Stars", 
-                        callback_data=f"pay_telegram_star_{user_id}_{result['location']}"
-                    )]
-                ]
-                
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
+                reply_markup = await self._build_guaranteed_invoice_markup(user_id, chat_id)
                 await update.message.reply_text(
-                    f"😔 {result['message']}", 
+                    f"😔 {result['message']}",
                     reply_markup=reply_markup
                 )
                 return
@@ -1457,28 +1985,38 @@ class FishBot:
     
     async def send_rod_repair_invoice(self, query, user_id: int, rod_name: str, repair_cost: int):
         """Отправить инвойс на оплату ремонта удочки"""
+        # Создаём invoice_url через TelegramBotAPI.create_invoice_link
+        from config import BOT_TOKEN, STAR_NAME
+        import traceback
+        invoice_error = None
         try:
-            # Отправляем invoice в ЛС пользователю
-            await self.application.bot.send_invoice(
-                chat_id=user_id,
-                title=f"⚡ Мгновенный ремонт удочки",
+            from bot import TelegramBotAPI as _TelegramBotAPI
+            tg_api = _TelegramBotAPI(BOT_TOKEN)
+            logger.info(f"[INVOICE] Creating invoice link for repair: rod={rod_name}, user_id={user_id}, cost={repair_cost}")
+            invoice_url = await tg_api.create_invoice_link(
+                title=f"Мгновенный ремонт удочки",
                 description=f"Восстановить '{rod_name}' до полной прочности",
-                payload=f"repair_rod_{rod_name}",
-                provider_token="",  # Пустой для Telegram Stars
-                currency="XTR",  # Telegram Stars
-                prices=[LabeledPrice(label=f"Ремонт {rod_name}", amount=repair_cost)]
+                payload=f"repair_rod_{rod_name}_{user_id}_{int(datetime.now().timestamp())}",
+                currency="XTR",
+                prices=[{"label": f"Ремонт {rod_name}", "amount": repair_cost}]
             )
-            
-            await query.edit_message_text(
-                f"💳 Счёт на {repair_cost} ⭐ отправлен вам в личные сообщения.\n"
-                f"Оплатите для мгновенного восстановления удочки."
-            )
+            logger.info(f"[INVOICE] Got invoice_url: {invoice_url}")
         except Exception as e:
-            logger.error(f"Error sending repair invoice: {e}")
-            await query.edit_message_text(
-                f"❌ Не удалось отправить счёт.\n"
-                f"Убедитесь, что вы написали боту в личку (/start в ЛС)."
+            logger.error(f"[INVOICE] Failed to get invoice_url for repair: {e}")
+            invoice_url = None
+            invoice_error = str(e) + "\n" + traceback.format_exc()
+        if invoice_url:
+            await self.send_invoice_url_button(
+                chat_id=query.message.chat_id,
+                invoice_url=invoice_url,
+                text=f"⭐ Оплатите {repair_cost} Telegram Stars для мгновенного восстановления удочки.",
+                user_id=user_id
             )
+        else:
+            error_text = f"(Ошибка генерации ссылки для оплаты)"
+            if invoice_error:
+                error_text += f"\nОшибка: {invoice_error}"
+            await query.edit_message_text(error_text, parse_mode=None)
 
         
     async def handle_back_to_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1515,19 +2053,20 @@ class FishBot:
         
         rods = db.get_rods()
         keyboard = []
-        
+        player = db.get_player(user_id, chat_id)
+        player_level = player.get('level', 0) if player else 0
         for rod in rods:
+            # Гарпун только для 25+ уровня
+            if rod['name'] == 'Гарпун' and player_level < 25:
+                continue
             keyboard.append([InlineKeyboardButton(
                 f"🎣 {rod['name']} - {rod['price']} 🪙",
                 callback_data=f"buy_rod_{rod['id']}_{user_id}"
             )])
-        
         # Добавляем кнопку возврата в магазин
         keyboard.append([InlineKeyboardButton("🔙 Магазин", callback_data=f"shop_{user_id}")])
-        
         reply_markup = InlineKeyboardMarkup(keyboard)
         message = "🛒 Магазин удочек:"
-        
         try:
             await query.edit_message_text(message, reply_markup=reply_markup)
         except Exception as e:
@@ -2198,27 +2737,52 @@ class FishBot:
             fish_counts[name]['count'] += 1
             fish_counts[name]['total_price'] += fish['price']
             total_value += fish['price']
-        
-        # Создаем кнопки для продажи каждого вида рыбы
+
+        # --- ПАГИНАЦИЯ ---
+        # Получаем текущую страницу из callback_data или context.user_data
+        page = 0
+        if query and query.data.startswith("sell_page_"):
+            try:
+                page = int(query.data.split('_')[2])
+            except Exception:
+                page = 0
+        elif hasattr(context, 'user_data') and 'sell_page' in context.user_data:
+            page = context.user_data['sell_page']
+        else:
+            page = 0
+        fish_list = sorted(fish_counts.items())
+        page_size = 10
+        total_pages = max(1, (len(fish_list) + page_size - 1) // page_size)
+        page = max(0, min(page, total_pages - 1))
+        context.user_data['sell_page'] = page
+        start = page * page_size
+        end = start + page_size
+        page_fish = fish_list[start:end]
+
         keyboard = []
-        for fish_name, info in sorted(fish_counts.items()):
+        for fish_name, info in page_fish:
             button_text = f"{fish_name} (×{info['count']}) - {info['total_price']} 🪙"
             keyboard.append([InlineKeyboardButton(button_text, callback_data=f"sell_species_{fish_name.replace(' ', '_')}_{user_id}")])
-        
+
         # Добавляем кнопку продажи всего
         if total_value > 0:
             keyboard.append([InlineKeyboardButton(f"💰 Продать всё ({total_value} 🪙)", callback_data=f"sell_all_{user_id}")])
-        
+
+        # Стрелки пагинации
+        nav_buttons = []
+        if total_pages > 1:
+            if page > 0:
+                nav_buttons.append(InlineKeyboardButton("⬅️", callback_data=f"sell_page_{page-1}_{user_id}"))
+            nav_buttons.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"))
+            if page < total_pages - 1:
+                nav_buttons.append(InlineKeyboardButton("➡️", callback_data=f"sell_page_{page+1}_{user_id}"))
+            keyboard.append(nav_buttons)
+
         keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data=f"back_to_menu_{user_id}")])
-        
+
         reply_markup = InlineKeyboardMarkup(keyboard)
-        message = f"""🐟 Лавка рыбы
+        message = f"""🐟 Лавка рыбы\n\nВсего рыбы к продаже: {len(unsold_fish)}\nОбщая стоимость: {total_value} 🪙\n\nВыберите что продать:"""
 
-    Всего рыбы к продаже: {len(unsold_fish)}
-Общая стоимость: {total_value} 🪙
-
-Выберите что продать:"""
-        
         if query:
             await query.edit_message_text(message, reply_markup=reply_markup)
         else:
@@ -2266,8 +2830,6 @@ class FishBot:
                 length_loc = str(fish.get('length'))
                 if length_loc in valid_locations:
                     loc = length_loc
-                else:
-                    continue
             if loc not in locations:
                 locations[loc] = []
             locations[loc].append(fish)
@@ -2281,23 +2843,23 @@ class FishBot:
             else:
                 await update.message.reply_text(message, reply_markup=reply_markup)
             return
-        
+
         # Создаем кнопки для каждой локации
         keyboard = []
         for location in sorted(locations.keys(), key=lambda v: str(v)):
             fish_count = len(locations[location])
             button_text = f"📍 {location} ({fish_count} рыб)"
             keyboard.append([InlineKeyboardButton(button_text, callback_data=f"inv_location_{location.replace(' ', '_')}_{user_id}")])
-        
+
         keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data=f"back_to_menu_{user_id}")])
-        
+
         reply_markup = InlineKeyboardMarkup(keyboard)
         message = f"""🎒 Инвентарь
 
 Всего пойманной рыбы: {len(unsold_fish)}
 
 Выберите локацию для просмотра:"""
-        
+
         if query:
             await query.edit_message_text(message, reply_markup=reply_markup)
         else:
@@ -2329,49 +2891,69 @@ class FishBot:
         # Получаем рыбу с этой локации
         caught_fish = db.get_caught_fish(user_id, chat_id)
         location_fish = [f for f in caught_fish if f['location'] == location and f.get('sold', 0) == 0]
-        
+
         if not location_fish:
             await query.edit_message_text(f"На локации {location} нет пойманной рыбы.")
             return
-        
-        # Форматируем список рыбы (цитата + спойлер)
-        lines = []
-        for i, fish in enumerate(location_fish, 1):
-            rarity_emoji = {
-                'Обычная': '⚪',
-                'Редкая': '🔵',
-                'Легендарная': '🟣'
-            }
-            fish_name = html.escape(str(fish.get('fish_name', '')))
-            weight = html.escape(str(fish.get('weight', 0)))
+
+        # --- ПАГИНАЦИЯ ---
+        page = 0
+        # Формат callback_data: inv_location_{location}_{user_id}_page_{page}
+        if query.data.startswith("inv_location_") and "_page_" in query.data:
+            try:
+                page = int(query.data.split("_page_")[-1])
+            except Exception:
+                page = 0
+        elif hasattr(context, 'user_data') and 'inv_page' in context.user_data:
+            page = context.user_data['inv_page']
+        else:
+            page = 0
+        page_size = 10
+        total_pages = max(1, (len(location_fish) + page_size - 1) // page_size)
+        page = max(0, min(page, total_pages - 1))
+        context.user_data['inv_page'] = page
+        start = page * page_size
+        end = start + page_size
+        page_fish = location_fish[start:end]
+
+        # Кнопки по каждой рыбе (индивидуально)
+        keyboard = []
+        rarity_emoji = {
+            'Обычная': '⚪',
+            'Редкая': '🔵',
+            'Легендарная': '🟣'
+        }
+        for fish in page_fish:
+            fish_name = fish.get('fish_name', '')
+            weight = fish.get('weight', 0)
             length_val = fish.get('length', 0)
-            length_str = f" | Размер: {length_val} см" if length_val and length_val > 0 else ""
-            if fish.get('is_trash'):
-                lines.append(
-                    f"{i}. 🗑️ {fish_name}\n"
-                    f"   Вес: {weight} кг\n"
-                )
-            else:
-                rarity = fish.get('rarity', 'Обычная')
-                lines.append(
-                    f"{i}. {fish_name}\n"
-                    f"   Вес: {weight} кг{html.escape(length_str)}\n"
-                    f"   {rarity_emoji.get(rarity, '⚪')} {html.escape(rarity)}\n"
-                )
-        fish_list = "\n".join(lines).strip()
+            length_str = f" | {length_val} см" if length_val and length_val > 0 else ""
+            rarity = fish.get('rarity', 'Обычная')
+            trash = fish.get('is_trash', False)
+            btn_text = f"🗑️ {fish_name} ({weight} кг)" if trash else f"{rarity_emoji.get(rarity, '⚪')} {fish_name} ({weight} кг{length_str})"
+            # Можно добавить callback для подробностей или продажи одной рыбы
+            keyboard.append([InlineKeyboardButton(btn_text, callback_data="noop")])
+
+        # Стрелки пагинации
+        nav_buttons = []
+        if total_pages > 1:
+            if page > 0:
+                nav_buttons.append(InlineKeyboardButton("⬅️", callback_data=f"inv_location_{location.replace(' ', '_')}_{user_id}_page_{page-1}"))
+            nav_buttons.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"))
+            if page < total_pages - 1:
+                nav_buttons.append(InlineKeyboardButton("➡️", callback_data=f"inv_location_{location.replace(' ', '_')}_{user_id}_page_{page+1}"))
+            keyboard.append(nav_buttons)
+
+        # Кнопка назад
+        keyboard.append([InlineKeyboardButton("◀️ Назад к локациям", callback_data=f"inventory_{user_id}")])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
         location_text = html.escape(str(location))
         message = (
             f"📍 {location_text}\n\n"
-            "Рыба, поймана на этой локации:\n\n"
-            f"<blockquote><span class=\"tg-spoiler\">{fish_list}</span></blockquote>\n\n"
-            f"Всего рыбы: {len(location_fish)}"
+            f"Рыба на этой локации: {len(location_fish)} шт.\n"
+            f"Показано: {start+1}-{min(end, len(location_fish))} из {len(location_fish)}"
         )
-        
-        keyboard = [
-            [InlineKeyboardButton("◀️ Назад к локациям", callback_data=f"inventory_{user_id}")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
         try:
             await query.edit_message_text(message, reply_markup=reply_markup, parse_mode="HTML")
         except Exception as e:
@@ -2937,6 +3519,11 @@ class FishBot:
     
     async def handle_fish_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка сообщения 'рыбалка' и других текстовых сообщений"""
+        if context.user_data.get('new_tour'):
+            consumed = await self.handle_new_tour_input(update, context)
+            if consumed:
+                return
+
         if 'waiting_sell_selection' in context.user_data:
             data = context.user_data['waiting_sell_selection']
             user_id = update.effective_user.id
@@ -3275,14 +3862,7 @@ class FishBot:
         can_fish, message = game.can_fish(user_id, chat_id)
         if not can_fish:
             # Отправляем сообщение с причиной и кнопкой оплаты
-            keyboard = [
-                [InlineKeyboardButton(
-                    f"⭐ Оплатить {GUARANTEED_CATCH_COST} Telegram Stars", 
-                    callback_data=f"pay_telegram_star_{user_id}_{player['current_location']}"
-                )]
-            ]
-            
-            reply_markup = InlineKeyboardMarkup(keyboard)
+            reply_markup = await self._build_guaranteed_invoice_markup(user_id, chat_id)
             
             await query.edit_message_text(
                 f"⏰ {message}", 
@@ -3317,11 +3897,12 @@ class FishBot:
                         if image_path.exists():
                             reply_to_id = query.message.message_id if query and query.message else None
                             try:
-                                sticker_message = await self.application.bot.send_document(
-                                    chat_id=update.effective_chat.id,
-                                    document=open(image_path, 'rb'),
-                                    reply_to_message_id=reply_to_id
-                                )
+                                with open(image_path, 'rb') as f:
+                                    sticker_message = await self.application.bot.send_document(
+                                        chat_id=update.effective_chat.id,
+                                        document=f,
+                                        reply_to_message_id=reply_to_id
+                                    )
                                 if sticker_message:
                                     context.bot_data.setdefault("last_bot_stickers", {})[update.effective_chat.id] = sticker_message.message_id
                             except Exception as send_exc:
@@ -3389,11 +3970,12 @@ class FishBot:
                 try:
                     fish_image = FISH_STICKERS[fish['name']]
                     image_path = Path(__file__).parent / fish_image
-                    sticker_message = await self.application.bot.send_document(
-                        chat_id=update.effective_chat.id,
-                        document=open(image_path, 'rb'),
-                        reply_to_message_id=query.message.reply_to_message.message_id if query.message.reply_to_message else None
-                    )
+                    with open(image_path, 'rb') as f:
+                        sticker_message = await self.application.bot.send_document(
+                            chat_id=update.effective_chat.id,
+                            document=f,
+                            reply_to_message_id=query.message.reply_to_message.message_id if query.message.reply_to_message else None
+                        )
                     if sticker_message:
                         context.bot_data.setdefault("last_bot_stickers", {})[update.effective_chat.id] = sticker_message.message_id
                         context.bot_data.setdefault("sticker_fish_map", {})[sticker_message.message_id] = {
@@ -3488,10 +4070,11 @@ class FishBot:
                     try:
                         trash_image = TRASH_STICKERS[result['trash']['name']]
                         image_path = Path(__file__).parent / trash_image
-                        sticker_message = await self.application.bot.send_document(
-                            chat_id=update.effective_chat.id,
-                            document=open(image_path, 'rb')
-                        )
+                        with open(image_path, 'rb') as f:
+                            sticker_message = await self.application.bot.send_document(
+                                chat_id=update.effective_chat.id,
+                                document=f
+                            )
                         if sticker_message:
                             context.bot_data.setdefault("last_bot_stickers", {})[update.effective_chat.id] = sticker_message.message_id
                     except Exception as e:
@@ -3509,14 +4092,7 @@ class FishBot:
                 return
             elif result.get('no_bite'):
                 # Отправляем сообщение с причиной и кнопкой оплаты
-                keyboard = [
-                    [InlineKeyboardButton(
-                        f"⭐ Оплатить {GUARANTEED_CATCH_COST} Telegram Stars", 
-                        callback_data=f"pay_telegram_star_{user_id}_{result['location']}"
-                    )]
-                ]
-                
-                reply_markup = InlineKeyboardMarkup(keyboard)
+                reply_markup = await self._build_guaranteed_invoice_markup(user_id, chat_id)
                 
                 message = f"""
 😔 {result['message']}
@@ -3528,14 +4104,7 @@ class FishBot:
                 return
             else:
                 # Отправляем сообщение с причиной и кнопкой оплаты
-                keyboard = [
-                    [InlineKeyboardButton(
-                        f"⭐ Оплатить {GUARANTEED_CATCH_COST} Telegram Stars", 
-                        callback_data=f"pay_telegram_star_{user_id}_{result['location']}"
-                    )]
-                ]
-                
-                reply_markup = InlineKeyboardMarkup(keyboard)
+                reply_markup = await self._build_guaranteed_invoice_markup(user_id, chat_id)
                 
                 message = f"""
 😔 {result['message']}
@@ -3554,9 +4123,20 @@ class FishBot:
         payload = getattr(query, "invoice_payload", "") or ""
         if payload.startswith("guaranteed_"):
             user_id = query.from_user.id
-            active = self.active_invoices.get(user_id)
-            if not active or active.get("payload") != payload:
+            parsed = self._parse_guaranteed_payload(payload)
+            if not parsed:
                 await query.answer(ok=False, error_message="Инвойс устарел. Запросите новый.")
+                return
+
+            payload_user_id = parsed.get("payload_user_id")
+            if payload_user_id is not None and payload_user_id != user_id:
+                await query.answer(ok=False, error_message="Этот инвойс создан для другого пользователя.")
+                return
+
+            created_ts = parsed.get("created_ts")
+            now_ts = int(datetime.now().timestamp())
+            if isinstance(created_ts, int) and now_ts - created_ts > 900:
+                await query.answer(ok=False, error_message="Срок действия инвойса истек. Запросите новый.")
                 return
         await query.answer(ok=True)
     
@@ -3565,18 +4145,38 @@ class FishBot:
         payment = update.message.successful_payment
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
+        payload = payment.invoice_payload or ""
+        active_invoice = self.active_invoices.get(user_id) or {}
+
+        accounting_chat_id = chat_id
+        parsed_guaranteed_payload = None
+        if payload.startswith("guaranteed_"):
+            parsed_guaranteed_payload = self._parse_guaranteed_payload(payload)
+            if parsed_guaranteed_payload and parsed_guaranteed_payload.get("group_chat_id"):
+                accounting_chat_id = int(parsed_guaranteed_payload["group_chat_id"])
+        elif active_invoice.get("group_chat_id"):
+            try:
+                accounting_chat_id = int(active_invoice.get("group_chat_id"))
+            except (TypeError, ValueError):
+                accounting_chat_id = chat_id
+
+        accounting_chat_title = None
+        if accounting_chat_id == chat_id:
+            try:
+                accounting_chat_title = update.effective_chat.title
+            except Exception:
+                accounting_chat_title = None
+        else:
+            try:
+                accounting_chat_title = db.get_chat_title(accounting_chat_id)
+            except Exception:
+                accounting_chat_title = None
 
         telegram_payment_charge_id = getattr(payment, "telegram_payment_charge_id", None)
         total_amount = getattr(payment, "total_amount", 0)
 
         # Сохраняем транзакцию
         if telegram_payment_charge_id:
-            # try to include chat metadata when recording the transaction
-            chat_title = None
-            try:
-                chat_title = update.effective_chat.title
-            except Exception:
-                chat_title = None
             try:
                 # If DB supports chat_id/chat_title columns, add them via migration-aware method
                 db.add_star_transaction(
@@ -3584,11 +4184,11 @@ class FishBot:
                     telegram_payment_charge_id=telegram_payment_charge_id,
                     total_amount=total_amount,
                     refund_status="none",
-                    chat_id=chat_id,
-                    chat_title=chat_title,
+                    chat_id=accounting_chat_id,
+                    chat_title=accounting_chat_title,
                 )
                 # update chat-level aggregate (this will also save chat_title in chat_configs)
-                db.increment_chat_stars(chat_id, total_amount, chat_title=chat_title)
+                db.increment_chat_stars(accounting_chat_id, total_amount, chat_title=accounting_chat_title)
             except Exception as e:
                 logger.warning("Failed to record star transaction or increment chat stars: %s", e)
             # If DB has explicit star_transactions chat columns we will keep them in migration
@@ -3599,7 +4199,6 @@ class FishBot:
             del self.active_timeouts[timeout_key]
         
         # Извлекаем локацию и chat_id из payload (если есть) или используем текущую
-        payload = payment.invoice_payload
         if payload and payload.startswith("repair_rod_"):
             # Обработка восстановления удочки
             rod_name = payload.replace("repair_rod_", "")
@@ -3611,7 +4210,7 @@ class FishBot:
                 except Exception as e:
                     logger.warning(f"Could not send temp rod repair rejection to {user_id}: {e}")
                 return
-            db.repair_rod(user_id, rod_name, update.effective_chat.id)
+            db.repair_rod(user_id, rod_name, accounting_chat_id)
             
             # Отправляем подтверждение в ЛС
             try:
@@ -3622,16 +4221,22 @@ class FishBot:
                 logger.warning(f"Could not send repair confirmation to {user_id}: {e}")
             return
         elif payload and payload.startswith("guaranteed_"):
-            parts = payload.replace("guaranteed_", "").rsplit("_", 2)
-            if len(parts) >= 3:
-                location = parts[0]
-                group_chat_id = int(parts[1])
-            elif len(parts) == 2:
-                location = parts[0]
-                group_chat_id = int(parts[1])
+            parsed = parsed_guaranteed_payload or self._parse_guaranteed_payload(payload)
+            if parsed:
+                group_chat_id = parsed.get("group_chat_id", update.effective_chat.id)
+                location = parsed.get("location")
             else:
-                location = "Неизвестно"
+                location = None
                 group_chat_id = update.effective_chat.id
+
+            if not location:
+                location = "Неизвестно"
+                try:
+                    player_by_group = db.get_player(user_id, group_chat_id)
+                    if player_by_group and player_by_group.get('current_location'):
+                        location = player_by_group['current_location']
+                except Exception as e:
+                    logger.warning(f"Could not resolve location for guaranteed payload user={user_id}, chat={group_chat_id}: {e}")
         else:
             # Получаем текущую локацию игрока
             player = db.get_player(user_id, chat_id)
@@ -3866,7 +4471,9 @@ class FishBot:
         existing_invoice = self.active_invoices.get(user_id)
         if existing_invoice:
             created_at = existing_invoice.get("created_at")
-            if created_at:
+            if isinstance(created_at, datetime):
+                created_time = created_at
+            elif isinstance(created_at, str):
                 try:
                     created_time = datetime.fromisoformat(created_at)
                 except ValueError:
@@ -3881,61 +4488,17 @@ class FishBot:
                     return
 
             await self.cancel_previous_invoice(user_id)
-        
-        # Создаем ссылку на чат
-        if update.effective_chat.type == 'private':
-            chat_link = f"Личные сообщения с @{update.effective_user.username or 'user'}"
-        else:
-            chat_link = f"Чат: {update.effective_chat.title}"
-        
-        # Создаем инвойс для оплаты в личные сообщения
-        from telegram import LabeledPrice
-        
-        prices = [
-            LabeledPrice('Гарантированный улов', GUARANTEED_CATCH_COST)
-        ]
-        
-        description = f"Гарантированный улов рыбы на локации: {location}\n\n📍 {chat_link}"
-        
-        # Отправляем инвойс в личные сообщения пользователю
-        invoice_payload = f"guaranteed_{location}_{chat_id}_{int(datetime.now().timestamp())}"
-        try:
-            await context.bot.send_invoice(
-                chat_id=user_id,  # Отправляем в личку
-                title=f"Закинуть сейчас",
-                description=description,
-                payload=invoice_payload,
-                provider_token="",  # Пусто для Telegram Stars
-                currency='XTR',
-                prices=prices
-            )
-        except Exception as e:
-            logger.error(f"Failed to send invoice to user {user_id}: {e}")
-            await query.answer("❌ Ошибка: чат со мной не начат. Сначала напишите /start в личные сообщения боту (@MDfish_bot)", show_alert=True)
-            return
-        
-        # Сохраняем информацию о сообщении с кнопкой для последующей отправки стикера в ответ
-        self.active_invoices[user_id] = {
-            'group_chat_id': chat_id,
-            'group_message_id': query.message.message_id,  # Сообщение с кнопкой в группе
-            'location': location,
-            'payload': invoice_payload,
-            'created_at': datetime.now().isoformat()
-        }
-        logger.info(f"Saved invoice info for user {user_id}: group_chat_id={chat_id}, group_message_id={query.message.message_id}")
 
-        await self.schedule_timeout(
-            chat_id,
-            query.message.message_id,
-            "Время для оплаты истекло",
-            timeout_seconds=120,
-            timeout_callback=self.handle_payment_timeout
-        )
-        
-        # Редактируем сообщение с кнопкой чтобы показать что инвойс отправлен
-        await query.edit_message_text(
-            f"💳 Инвойс для оплаты отправлен вам в личные сообщения!\n\n⭐ Оплатите {GUARANTEED_CATCH_COST} Telegram Stars для гарантированного улова на локации: {location}"
-        )
+        # Legacy callback: преобразуем в URL-кнопку на месте без дополнительных сообщений
+        reply_markup = await self._build_guaranteed_invoice_markup(user_id, chat_id)
+        if not reply_markup:
+            await query.answer("Не удалось создать ссылку оплаты", show_alert=True)
+            return
+        try:
+            await query.edit_message_reply_markup(reply_markup=reply_markup)
+        except BadRequest:
+            pass
+        await query.answer("Ссылка оплаты обновлена. Нажмите кнопку ещё раз.", show_alert=False)
     
     async def handle_invoice_sent_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка нажатия на сообщение об отправленном инвойсе"""
@@ -3986,11 +4549,21 @@ class FishBot:
     
     async def error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
         """Обработчик ошибок с улучшенным логированием"""
-        logger.error(f"Update {update} caused error {context.error}")
+        error = context.error
+
+        # Частый кейс при запуске двух инстансов с одним токеном
+        if isinstance(error, Conflict):
+            logger.warning("Conflict: запущено несколько инстансов бота с одним токеном")
+            return
+
+        # Временные сетевые ошибки Telegram API не требуют сообщения пользователю
+        if isinstance(error, NetworkError):
+            logger.warning(f"Сетевая ошибка Telegram API: {error}")
+            return
+
+        logger.error(f"Update {update} caused error {error}")
         
         # Проверяем тип ошибки
-        error = context.error
-        
         if isinstance(error, requests.exceptions.ConnectionError):
             logger.error("Проблема с подключением к Telegram API. Проверьте интернет-соединение.")
         elif isinstance(error, requests.exceptions.Timeout):
@@ -4246,7 +4819,8 @@ def main():
 
             # send in private chat
             try:
-                await context.bot.send_document(chat_id=user_id, document=open(gz_path, 'rb'))
+                with open(gz_path, 'rb') as f:
+                    await context.bot.send_document(chat_id=user_id, document=f)
                 await update.message.reply_text(f"Отправил {gz_path.name} в личку.")
             except Exception as e:
                 await update.message.reply_text(f"Ошибка при отправке: {e}")
@@ -4408,7 +4982,7 @@ def main():
                 try:
                     chat_id = c.get('chat_id')
                     if chat_id:
-                        chat_obj = await self.application.bot.get_chat(chat_id)
+                        chat_obj = await bot_instance.application.bot.get_chat(chat_id)
                         fetched_title = getattr(chat_obj, 'title', None) or getattr(chat_obj, 'username', None) or (getattr(chat_obj, 'first_name', None) or '')
                         if fetched_title:
                             title = fetched_title
@@ -4554,6 +5128,7 @@ def main():
     application.add_handler(CommandHandler("grant_net", grant_net_command))
     application.add_handler(CommandHandler("grant_rod", grant_rod_command))
     application.add_handler(CommandHandler("chatstar", chatstar_command))
+    application.add_handler(CommandHandler("new_tour", bot_instance.new_tour_command))
     # debug handlers removed
     application.add_handler(CommandHandler("fish", bot_instance.fish_command))
     application.add_handler(CommandHandler("menu", bot_instance.menu_command))
@@ -4603,6 +5178,7 @@ def main():
     application.add_handler(CallbackQueryHandler(bot_instance.handle_select_bait, pattern="^select_bait_"))
     application.add_handler(CallbackQueryHandler(bot_instance.handle_select_bait, pattern="^sbi_"))
     application.add_handler(CallbackQueryHandler(bot_instance.handle_select_net, pattern="^select_net_"))  # Выбор сети в меню
+    application.add_handler(CallbackQueryHandler(bot_instance.handle_pay_invoice_callback, pattern="^pay_invoice:"))
     application.add_handler(CallbackQueryHandler(bot_instance.handle_use_net, pattern="^use_net_"))  # Использование сетей
     application.add_handler(CallbackQueryHandler(bot_instance.handle_back_to_menu, pattern="^back_to_menu_"))
     application.add_handler(CallbackQueryHandler(bot_instance.handle_sell_fish, pattern=r"^sell_fish_\d+$"))
@@ -4624,6 +5200,7 @@ def main():
     application.add_handler(CallbackQueryHandler(bot_instance.handle_repair_callback, pattern="^repair_"))
     application.add_handler(CallbackQueryHandler(bot_instance.handle_stats_callback, pattern="^stats_"))
     application.add_handler(CallbackQueryHandler(bot_instance.handle_leaderboard_callback, pattern="^leaderboard$"))
+    application.add_handler(CallbackQueryHandler(bot_instance.handle_tour_type_callback, pattern="^tour_type_"))
     application.add_handler(CallbackQueryHandler(bot_instance.handle_payment_expired_callback, pattern="^payment_expired$"))
     application.add_handler(CallbackQueryHandler(bot_instance.handle_invoice_cancelled_callback, pattern="^invoice_cancelled$"))
     application.add_handler(CallbackQueryHandler(bot_instance.handle_pay_telegram_star_callback, pattern="^pay_telegram_star_"))

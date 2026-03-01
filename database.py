@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import logging
 import random
 from typing import Any, Dict, List, Optional, Union
@@ -299,6 +300,9 @@ def ensure_serial_pk(conn, table: str, id_col: str = 'id'):
     """Ensure the integer primary key column has a Postgres sequence DEFAULT.
     Safe to call multiple times; will create sequence if missing and set it to max(id).
     """
+    # Для SQLite ничего не делаем
+    if hasattr(conn, 'execute'):
+        return
     try:
         cur = conn.cursor()
         cur.execute(
@@ -341,7 +345,11 @@ def ensure_all_serial_pks(conn):
     Finds PK columns of integer types without a nextval() default and installs
     a sequence + DEFAULT for them. Safe to call multiple times.
     """
+    # Для SQLite ничего не делаем, для Postgres оставляем как есть
     try:
+        if hasattr(conn, 'execute'):
+            # SQLite: пропускаем
+            return
         cur = conn.cursor()
         cur.execute(
             """
@@ -420,11 +428,11 @@ class Database:
         self.init_db()
 
     def _connect(self):
-        # Postgres-only: require DATABASE_URL in environment
         db_url = os.getenv('DATABASE_URL')
-        if not db_url:
-            raise RuntimeError('DATABASE_URL must be set to use Postgres')
-        return PostgresConnWrapper(db_url)
+        if db_url:
+            return PostgresConnWrapper(db_url)
+        # Fallback to SQLite for testing/dev
+        return sqlite3.connect(str(DB_PATH))
 
     def _get_temp_rod_uses(self, rod_name: str) -> Optional[int]:
         rod_range = TEMP_ROD_RANGES.get(rod_name)
@@ -646,11 +654,41 @@ class Database:
                 )
             ''')
 
+            # Таблица реферальной статистики звёзд (агрегаты по user_id + chat_id)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS ref_stars_stats (
+                    user_id BIGINT NOT NULL,
+                    chat_id BIGINT NOT NULL,
+                    stars_received INTEGER DEFAULT 0,
+                    stars_spent INTEGER DEFAULT 0,
+                    stars_refunded INTEGER DEFAULT 0,
+                    stars_withdrawn INTEGER DEFAULT 0,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (user_id, chat_id)
+                )
+            ''')
+
             # Таблица системных флагов/миграций
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS system_flags (
                     key TEXT PRIMARY KEY,
                     value TEXT
+                )
+            ''')
+
+            # Таблица турниров (конкурсов)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS tournaments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id BIGINT NOT NULL,
+                    created_by BIGINT NOT NULL,
+                    title TEXT NOT NULL,
+                    tournament_type TEXT NOT NULL,
+                    target_fish TEXT,
+                    starts_at TIMESTAMP NOT NULL,
+                    ends_at TIMESTAMP NOT NULL,
+                    status TEXT DEFAULT 'scheduled',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
             
@@ -668,9 +706,12 @@ class Database:
 
         # Миграции - добавляем колонки если их нет
         self._run_migrations()
-        
-        # Заполняем начальными данными
-        self._fill_default_data()
+
+        # Заполняем начальными данными (можно отключить для smoke-check БД)
+        if os.getenv('FISHBOT_SKIP_DEFAULT_FILL') == '1':
+            logger.info('Skipping _fill_default_data due to FISHBOT_SKIP_DEFAULT_FILL=1')
+        else:
+            self._fill_default_data()
     
     def _run_migrations(self):
         """Выполнение миграций для обновления схемы БД"""
@@ -678,63 +719,93 @@ class Database:
             cursor = conn.cursor()
 
             def get_columns(table_name: str):
-                cursor.execute(
-                    "SELECT column_name FROM information_schema.columns WHERE table_name = %s AND table_schema = 'public'",
-                    (table_name,)
-                )
-                return [r[0] for r in cursor.fetchall()]
+                # SQLite: используем PRAGMA table_info
+                if type(cursor).__module__.startswith('sqlite3'):
+                    cursor.execute(f"PRAGMA table_info({table_name})")
+                    return [r[1] for r in cursor.fetchall()]
+                else:
+                    # Postgres: используем information_schema
+                    cursor.execute(
+                        "SELECT column_name FROM information_schema.columns WHERE table_name = %s AND table_schema = 'public'",
+                        (table_name,)
+                    )
+                    return [r[0] for r in cursor.fetchall()]
 
             # Проверяем наличие колонок в таблице players (Postgres-friendly)
             columns = get_columns('players')
 
-            if 'ref' not in columns:
-                cursor.execute('ALTER TABLE players ADD COLUMN ref INTEGER')
-                conn.commit()
+            # Добавление колонок для SQLite и Postgres
+            def add_column_if_missing(table, col, coltype):
+                cols = get_columns(table)
+                if col not in cols:
+                    try:
+                        cursor.execute(f'ALTER TABLE {table} ADD COLUMN {col} {coltype}')
+                        conn.commit()
+                    except Exception:
+                        pass
 
-            if 'ref_link' not in columns:
-                cursor.execute('ALTER TABLE players ADD COLUMN ref_link TEXT')
-                conn.commit()
+            add_column_if_missing('players', 'ref', 'INTEGER')
+            add_column_if_missing('players', 'ref_link', 'TEXT')
+            add_column_if_missing('players', 'chat_id', 'BIGINT')
+            add_column_if_missing('players', 'xp', 'INTEGER DEFAULT 0')
+            add_column_if_missing('players', 'level', 'INTEGER DEFAULT 0')
+            add_column_if_missing('players', 'last_net_use_time', 'TEXT')
+            add_column_if_missing('chat_configs', 'stars_total', 'INTEGER DEFAULT 0')
+            add_column_if_missing('chat_configs', 'chat_title', 'TEXT')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS tournaments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id BIGINT NOT NULL,
+                    created_by BIGINT NOT NULL,
+                    title TEXT NOT NULL,
+                    tournament_type TEXT NOT NULL,
+                    target_fish TEXT,
+                    starts_at TIMESTAMP NOT NULL,
+                    ends_at TIMESTAMP NOT NULL,
+                    status TEXT DEFAULT 'scheduled',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            add_column_if_missing('tournaments', 'target_fish', 'TEXT')
+            add_column_if_missing('tournaments', 'status', "TEXT DEFAULT 'scheduled'")
+            add_column_if_missing('tournaments', 'created_at', 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
 
-            if 'chat_id' not in columns:
-                cursor.execute('ALTER TABLE players ADD COLUMN chat_id BIGINT')
-                conn.commit()
-
-            # Ensure chat_configs has columns for tracking title and total stars
-            chat_conf_cols = get_columns('chat_configs')
-            if 'stars_total' not in chat_conf_cols:
-                try:
-                    cursor.execute('ALTER TABLE chat_configs ADD COLUMN stars_total INTEGER DEFAULT 0')
-                    conn.commit()
-                except Exception:
-                    pass
-            if 'chat_title' not in chat_conf_cols:
-                try:
-                    cursor.execute('ALTER TABLE chat_configs ADD COLUMN chat_title TEXT')
-                    conn.commit()
-                except Exception:
-                    pass
-
-            if 'xp' not in columns:
-                cursor.execute('ALTER TABLE players ADD COLUMN xp INTEGER DEFAULT 0')
-                conn.commit()
-
-            if 'level' not in columns:
-                cursor.execute('ALTER TABLE players ADD COLUMN level INTEGER DEFAULT 0')
-                conn.commit()
+            # Таблица агрегированной реф-статистики звёзд
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS ref_stars_stats (
+                    user_id BIGINT NOT NULL,
+                    chat_id BIGINT NOT NULL,
+                    stars_received INTEGER DEFAULT 0,
+                    stars_spent INTEGER DEFAULT 0,
+                    stars_refunded INTEGER DEFAULT 0,
+                    stars_withdrawn INTEGER DEFAULT 0,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (user_id, chat_id)
+                )
+            ''')
+            add_column_if_missing('ref_stars_stats', 'stars_received', 'INTEGER DEFAULT 0')
+            add_column_if_missing('ref_stars_stats', 'stars_spent', 'INTEGER DEFAULT 0')
+            add_column_if_missing('ref_stars_stats', 'stars_refunded', 'INTEGER DEFAULT 0')
+            add_column_if_missing('ref_stars_stats', 'stars_withdrawn', 'INTEGER DEFAULT 0')
 
             # CRITICAL: Migrate players table to use composite primary key (user_id, chat_id)
-            cursor.execute(
-                """
-                SELECT kcu.column_name
-                FROM information_schema.table_constraints tc
-                JOIN information_schema.key_column_usage kcu
-                  ON tc.constraint_name = kcu.constraint_name
-                  AND tc.table_schema = kcu.table_schema
-                WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_name = %s
-                """,
-                ('players',)
-            )
-            pk_cols = [r[0] for r in cursor.fetchall()]
+            pk_cols = []
+            if type(cursor).__module__.startswith('sqlite3'):
+                cursor.execute("PRAGMA table_info(players)")
+                pk_cols = [r[1] for r in cursor.fetchall() if r[5] == 1]
+            else:
+                cursor.execute(
+                    """
+                    SELECT kcu.column_name
+                    FROM information_schema.table_constraints tc
+                    JOIN information_schema.key_column_usage kcu
+                      ON tc.constraint_name = kcu.constraint_name
+                      AND tc.table_schema = kcu.table_schema
+                    WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_name = %s
+                    """,
+                    ('players',)
+                )
+                pk_cols = [r[0] for r in cursor.fetchall()]
 
             if pk_cols == ['user_id']:
                 # Need to recreate table with composite key
@@ -762,12 +833,19 @@ class Database:
                 ''')
 
                 # Copy data from old table, normalizing NULL chat_id to -1
-                cursor.execute('''
-                    INSERT INTO players_new (user_id, chat_id, username, coins, stars, xp, level, current_rod, current_bait, current_location, last_fish_time, is_banned, ban_until, created_at, ref, ref_link, last_net_use_time)
-                    SELECT user_id, COALESCE(chat_id, -1), username, coins, stars, COALESCE(xp, 0), COALESCE(level, 0), current_rod, current_bait, current_location, last_fish_time, is_banned, ban_until, created_at, ref, ref_link, last_net_use_time
-                    FROM players
-                    ON CONFLICT (user_id, chat_id) DO NOTHING
-                ''')
+                if type(cursor).__module__.startswith('sqlite3'):
+                    cursor.execute('''
+                        INSERT OR IGNORE INTO players_new (user_id, chat_id, username, coins, stars, xp, level, current_rod, current_bait, current_location, last_fish_time, is_banned, ban_until, created_at, ref, ref_link, last_net_use_time)
+                        SELECT user_id, COALESCE(chat_id, -1), username, coins, stars, COALESCE(xp, 0), COALESCE(level, 0), current_rod, current_bait, current_location, last_fish_time, is_banned, ban_until, created_at, ref, ref_link, last_net_use_time
+                        FROM players
+                    ''')
+                else:
+                    cursor.execute('''
+                        INSERT INTO players_new (user_id, chat_id, username, coins, stars, xp, level, current_rod, current_bait, current_location, last_fish_time, is_banned, ban_until, created_at, ref, ref_link, last_net_use_time)
+                        SELECT user_id, COALESCE(chat_id, -1), username, coins, stars, COALESCE(xp, 0), COALESCE(level, 0), current_rod, current_bait, current_location, last_fish_time, is_banned, ban_until, created_at, ref, ref_link, last_net_use_time
+                        FROM players
+                        ON CONFLICT (user_id, chat_id) DO NOTHING
+                    ''')
 
                 # Attempt to replace the old players table only if nothing
                 # references it via foreign key constraints. If other objects
@@ -919,39 +997,129 @@ class Database:
                 except Exception:
                     pass
 
+
+                # ===== Методы для /ref и вывода/вывода звёзд =====
+                def get_ref_access_chats(self, user_id: int) -> List[Dict[str, Any]]:
+                    """Получить чаты, где пользователь имеет доступ к реферальному выводу"""
+                    with self._connect() as conn:
+                        cursor = conn.cursor()
+                        cursor.execute('''
+                            SELECT chat_id, chat_title, stars_total
+                            FROM chat_configs
+                            WHERE admin_user_id = ? AND is_configured = 1
+                        ''', (user_id,))
+                        rows = cursor.fetchall()
+                        cols = [d[0] for d in cursor.description] if cursor.description else []
+                        return [dict(zip(cols, row)) for row in rows]
+
+                def get_chat_title(self, chat_id: int) -> str:
+                    """Получить название чата по chat_id"""
+                    with self._connect() as conn:
+                        cursor = conn.cursor()
+                        cursor.execute('SELECT chat_title FROM chat_configs WHERE chat_id = ?', (chat_id,))
+                        row = cursor.fetchone()
+                        return row[0] if row and row[0] else str(chat_id)
+
+                def get_chat_stars_total(self, chat_id: int) -> int:
+                    """Получить общее количество звёзд в чате"""
+                    with self._connect() as conn:
+                        cursor = conn.cursor()
+                        cursor.execute('SELECT COALESCE(stars_total, 0) FROM chat_configs WHERE chat_id = ?', (chat_id,))
+                        row = cursor.fetchone()
+                        return int(row[0]) if row else 0
+
+                def get_chat_refunds_total(self, chat_id: int) -> int:
+                    """Получить сумму всех выведенных/возвращённых звёзд по чату"""
+                    with self._connect() as conn:
+                        cursor = conn.cursor()
+                        cursor.execute('''
+                            SELECT COALESCE(SUM(total_amount), 0)
+                            FROM star_transactions
+                            WHERE chat_id = ? AND refund_status IN ("approved", "refunded")
+                        ''', (chat_id,))
+                        row = cursor.fetchone()
+                        return int(row[0]) if row else 0
+
+                def get_available_stars_for_withdraw(self, chat_id: int) -> int:
+                    """Получить количество звёзд, доступных для вывода в чате"""
+                    total = self.get_chat_stars_total(chat_id)
+                    withdrawn = self.get_chat_refunds_total(chat_id)
+                    return max(0, total - withdrawn)
+
+                def get_withdrawn_stars(self, chat_id: int) -> int:
+                    """Получить количество уже выведенных звёзд в чате"""
+                    return self.get_chat_refunds_total(chat_id)
+
+                def mark_stars_withdrawn(self, chat_id: int, amount: int, user_id: int, admin_id: int, status: str = "approved") -> bool:
+                    """Отметить вывод звёзд (создать транзакцию)"""
+                    with self._connect() as conn:
+                        cursor = conn.cursor()
+                        cursor.execute('''
+                            INSERT INTO star_transactions (user_id, total_amount, chat_id, chat_title, refund_status)
+                            VALUES (?, ?, ?, ?, ?)
+                        ''', (user_id, amount, chat_id, self.get_chat_title(chat_id), status))
+                        conn.commit()
+                        return cursor.rowcount > 0
             # Populate chat_id in player_rods and player_nets and caught_fish
-            cursor.execute('''
-                UPDATE player_rods
-                SET chat_id = (
-                    SELECT MAX(
-                        CASE WHEN COALESCE(p.chat_id::text, '') ~ '^[0-9]+$' THEN (p.chat_id::text)::bigint ELSE NULL END
-                    ) FROM players p WHERE p.user_id = player_rods.user_id
-                )
-                WHERE chat_id IS NULL OR chat_id < 1
-            ''')
+            if type(cursor).__module__.startswith('sqlite3'):
+                # SQLite: просто берем максимальный chat_id для каждого user_id, если он числовой
+                cursor.execute('''
+                    UPDATE player_rods
+                    SET chat_id = (
+                        SELECT MAX(chat_id) FROM players p WHERE p.user_id = player_rods.user_id AND CAST(chat_id AS TEXT) GLOB '[0-9]*'
+                    )
+                    WHERE chat_id IS NULL OR chat_id < 1
+                ''')
+            else:
+                cursor.execute('''
+                    UPDATE player_rods
+                    SET chat_id = (
+                        SELECT MAX(
+                            CASE WHEN COALESCE(p.chat_id::text, '') ~ '^[0-9]+$' THEN (p.chat_id::text)::bigint ELSE NULL END
+                        ) FROM players p WHERE p.user_id = player_rods.user_id
+                    )
+                    WHERE chat_id IS NULL OR chat_id < 1
+                ''')
             conn.commit()
 
-            cursor.execute('''
-                UPDATE player_nets
-                SET chat_id = (
-                    SELECT MAX(
-                        CASE WHEN COALESCE(p.chat_id::text, '') ~ '^[0-9]+$' THEN (p.chat_id::text)::bigint ELSE NULL END
-                    ) FROM players p WHERE p.user_id = player_nets.user_id
-                )
-                WHERE chat_id IS NULL OR chat_id < 1
-            ''')
-            conn.commit()
-
-            cursor.execute('''
-                UPDATE caught_fish
-                SET chat_id = (
-                    SELECT MAX(
-                        CASE WHEN COALESCE(p.chat_id::text, '') ~ '^[0-9]+$' THEN (p.chat_id::text)::bigint ELSE NULL END
-                    ) FROM players p WHERE p.user_id = caught_fish.user_id
-                )
-                WHERE chat_id IS NULL OR chat_id < 1
-            ''')
-            conn.commit()
+            if type(cursor).__module__.startswith('sqlite3'):
+                cursor.execute('''
+                    UPDATE player_nets
+                    SET chat_id = (
+                        SELECT MAX(chat_id) FROM players p WHERE p.user_id = player_nets.user_id AND CAST(chat_id AS TEXT) GLOB '[0-9]*'
+                    )
+                    WHERE chat_id IS NULL OR chat_id < 1
+                ''')
+                conn.commit()
+                cursor.execute('''
+                    UPDATE caught_fish
+                    SET chat_id = (
+                        SELECT MAX(chat_id) FROM players p WHERE p.user_id = caught_fish.user_id AND CAST(chat_id AS TEXT) GLOB '[0-9]*'
+                    )
+                    WHERE chat_id IS NULL OR chat_id < 1
+                ''')
+                conn.commit()
+            else:
+                cursor.execute('''
+                    UPDATE player_nets
+                    SET chat_id = (
+                        SELECT MAX(
+                            CASE WHEN COALESCE(p.chat_id::text, '') ~ '^[0-9]+$' THEN (p.chat_id::text)::bigint ELSE NULL END
+                        ) FROM players p WHERE p.user_id = player_nets.user_id
+                    )
+                    WHERE chat_id IS NULL OR chat_id < 1
+                ''')
+                conn.commit()
+                cursor.execute('''
+                    UPDATE caught_fish
+                    SET chat_id = (
+                        SELECT MAX(
+                            CASE WHEN COALESCE(p.chat_id::text, '') ~ '^[0-9]+$' THEN (p.chat_id::text)::bigint ELSE NULL END
+                        ) FROM players p WHERE p.user_id = caught_fish.user_id
+                    )
+                    WHERE chat_id IS NULL OR chat_id < 1
+                ''')
+                conn.commit()
 
             # Инициализация погоды для локаций
             cursor.execute('SELECT name FROM locations')
@@ -960,13 +1128,22 @@ class Database:
             from weather import weather_system
             for location in locations:
                 loc_name = location[0]
-                cursor.execute('SELECT 1 FROM weather WHERE location = %s', (loc_name,))
+                if type(cursor).__module__.startswith('sqlite3'):
+                    cursor.execute('SELECT 1 FROM weather WHERE location = ?', (loc_name,))
+                else:
+                    cursor.execute('SELECT 1 FROM weather WHERE location = %s', (loc_name,))
                 if not cursor.fetchone():
                     condition, temp = weather_system.generate_weather(loc_name)
-                    cursor.execute(
-                        'INSERT INTO weather (location, condition, temperature) VALUES (%s, %s, %s)',
-                        (loc_name, condition, temp),
-                    )
+                    if type(cursor).__module__.startswith('sqlite3'):
+                        cursor.execute(
+                            'INSERT INTO weather (location, condition, temperature) VALUES (?, ?, ?)',
+                            (loc_name, condition, temp),
+                        )
+                    else:
+                        cursor.execute(
+                            'INSERT INTO weather (location, condition, temperature) VALUES (%s, %s, %s)',
+                            (loc_name, condition, temp),
+                        )
                 # Ensure a global players row exists (user_id = -1, chat_id = -1)
                 try:
                     cursor.execute(
@@ -1003,8 +1180,9 @@ class Database:
             rods_data = [
                 ("Бамбуковая удочка", 0, 100, 100, 0, 20),  # стартовая удочка, макс вес 20 кг
                 ("Углепластиковая удочка", 1500, 150, 150, 5, 35),  # макс вес 35 кг
-                ("Карбоновая удочка", 4500, 200, 200, 10, 60),  # макс вес 60 кг
-                ("Золотая удочка", 15000, 300, 300, 20, 350),  # макс вес 200 кг
+                ("Карбоновая удочка", 4500, 200, 200, 10, 120),  # макс вес 120 кг
+                ("Золотая удочка", 15000, 300, 300, 20, 350),  # макс вес 350 кг
+                ("Гарпун", 75000, 100, 100, 0, 10000),  # гарпун: макс вес 10 тонн, мин. 150 кг (логика в game)
             ]
             
             cursor.executemany('''
@@ -1099,6 +1277,10 @@ class Database:
                 ("Крупный кусок мяса", 140, 9, "Все"),
                 ("Печень", 90, 6, "Все"),
                 ("Кусок мяса", 110, 7, "Все"),
+                # --- Кормушки ---
+                ("Кормушка простая", 500, 10, "feeder"),
+                ("Кормушка премиум", 2500, 25, "feeder"),
+                ("Кормушка звёздная", 0, 50, "feeder_star"),  # Покупка за 50 звёзд, цена в монетах = 0
             ]
 
             baits_data = [
@@ -2143,6 +2325,191 @@ class Database:
                 }
                 for row in rows
             ]
+
+    # ===== ТУРНИРЫ =====
+
+    def create_tournament(
+        self,
+        chat_id: int,
+        created_by: int,
+        title: str,
+        tournament_type: str,
+        starts_at: datetime,
+        ends_at: datetime,
+        target_fish: Optional[str] = None,
+    ) -> int:
+        """Создать турнир и вернуть его ID."""
+        starts_str = starts_at.strftime('%Y-%m-%d %H:%M:%S')
+        ends_str = ends_at.strftime('%Y-%m-%d %H:%M:%S')
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            if type(cursor).__module__.startswith('sqlite3'):
+                cursor.execute(
+                    '''
+                    INSERT INTO tournaments (chat_id, created_by, title, tournament_type, target_fish, starts_at, ends_at, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 'scheduled')
+                    ''',
+                    (int(chat_id), int(created_by), title, tournament_type, target_fish, starts_str, ends_str)
+                )
+            else:
+                cursor.execute(
+                    '''
+                    INSERT INTO tournaments (chat_id, created_by, title, tournament_type, target_fish, starts_at, ends_at, status)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, 'scheduled')
+                    RETURNING id
+                    ''',
+                    (int(chat_id), int(created_by), title, tournament_type, target_fish, starts_str, ends_str)
+                )
+            conn.commit()
+
+            if type(cursor).__module__.startswith('sqlite3'):
+                return int(cursor.lastrowid)
+            row = cursor.fetchone()
+            return int(row[0]) if row else 0
+
+    def get_tournament(self, tournament_id: int) -> Optional[Dict[str, Any]]:
+        """Получить турнир по ID."""
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            if type(cursor).__module__.startswith('sqlite3'):
+                cursor.execute('SELECT * FROM tournaments WHERE id = ? LIMIT 1', (int(tournament_id),))
+            else:
+                cursor.execute('SELECT * FROM tournaments WHERE id = %s LIMIT 1', (int(tournament_id),))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            cols = [d[0] for d in cursor.description]
+            return dict(zip(cols, row))
+
+    def get_active_tournament(self, chat_id: int, now_dt: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
+        """Получить активный (или ближайший scheduled) турнир для чата."""
+        now_dt = now_dt or datetime.now()
+        now_str = now_dt.strftime('%Y-%m-%d %H:%M:%S')
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            if type(cursor).__module__.startswith('sqlite3'):
+                cursor.execute(
+                    '''
+                    SELECT * FROM tournaments
+                    WHERE chat_id = ?
+                      AND (
+                        (datetime(starts_at) <= datetime(?) AND datetime(ends_at) >= datetime(?))
+                        OR status = 'scheduled'
+                      )
+                    ORDER BY
+                      CASE WHEN datetime(starts_at) <= datetime(?) AND datetime(ends_at) >= datetime(?) THEN 0 ELSE 1 END,
+                      datetime(starts_at) ASC
+                    LIMIT 1
+                    ''',
+                    (int(chat_id), now_str, now_str, now_str, now_str)
+                )
+            else:
+                cursor.execute(
+                    '''
+                    SELECT * FROM tournaments
+                    WHERE chat_id = %s
+                      AND (
+                        (starts_at <= %s AND ends_at >= %s)
+                        OR status = 'scheduled'
+                      )
+                    ORDER BY
+                      CASE WHEN starts_at <= %s AND ends_at >= %s THEN 0 ELSE 1 END,
+                      starts_at ASC
+                    LIMIT 1
+                    ''',
+                    (int(chat_id), now_str, now_str, now_str, now_str)
+                )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            cols = [d[0] for d in cursor.description]
+            return dict(zip(cols, row))
+
+    def get_tournament_leaderboard(self, tournament_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+        """Получить лидерборд турнира по его типу."""
+        tour = self.get_tournament(tournament_id)
+        if not tour:
+            return []
+
+        tour_type = (tour.get('tournament_type') or '').strip()
+        target_fish = (tour.get('target_fish') or '').strip() or None
+        chat_id = int(tour.get('chat_id'))
+        starts_at = str(tour.get('starts_at'))
+        ends_at = str(tour.get('ends_at'))
+
+        metric_expr = 'COALESCE(SUM(cf.weight), 0)'
+        extra_filter = ''
+        extra_params: List[Any] = []
+
+        if tour_type == 'longest_fish':
+            metric_expr = 'COALESCE(MAX(cf.length), 0)'
+        elif tour_type == 'biggest_weight':
+            metric_expr = 'COALESCE(MAX(cf.weight), 0)'
+        elif tour_type == 'total_weight':
+            metric_expr = 'COALESCE(SUM(cf.weight), 0)'
+        elif tour_type == 'specific_fish':
+            metric_expr = 'COALESCE(SUM(cf.weight), 0)'
+            extra_filter = ' AND TRIM(cf.fish_name) = ? '
+            if target_fish:
+                extra_params.append(target_fish)
+            else:
+                return []
+        else:
+            return []
+
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            if type(cursor).__module__.startswith('sqlite3'):
+                sql = f'''
+                    SELECT
+                        COALESCE(MAX(p.username), 'Неизвестно') AS username,
+                        cf.user_id,
+                        {metric_expr} AS metric,
+                        COUNT(cf.id) AS catches_count
+                    FROM caught_fish cf
+                    LEFT JOIN players p ON p.user_id = cf.user_id
+                    WHERE CAST(cf.chat_id AS BIGINT) = ?
+                      AND datetime(cf.caught_at) >= datetime(?)
+                      AND datetime(cf.caught_at) <= datetime(?)
+                      {extra_filter}
+                    GROUP BY cf.user_id
+                    ORDER BY metric DESC, catches_count DESC
+                    LIMIT ?
+                '''
+                params = [chat_id, starts_at, ends_at] + extra_params + [int(limit)]
+                cursor.execute(sql, params)
+            else:
+                sql = f'''
+                    SELECT
+                        COALESCE(MAX(p.username), 'Неизвестно') AS username,
+                        cf.user_id,
+                        {metric_expr} AS metric,
+                        COUNT(cf.id) AS catches_count
+                    FROM caught_fish cf
+                    LEFT JOIN players p ON p.user_id = cf.user_id
+                    WHERE CAST(cf.chat_id AS BIGINT) = %s
+                      AND cf.caught_at >= %s
+                      AND cf.caught_at <= %s
+                      {extra_filter.replace('?', '%s')}
+                    GROUP BY cf.user_id
+                    ORDER BY metric DESC, catches_count DESC
+                    LIMIT %s
+                '''
+                params = [chat_id, starts_at, ends_at] + extra_params + [int(limit)]
+                cursor.execute(sql, params)
+
+            rows = cursor.fetchall()
+            return [
+                {
+                    'username': row[0],
+                    'user_id': int(row[1]),
+                    'metric': float(row[2] or 0),
+                    'catches_count': int(row[3] or 0),
+                    'tournament_type': tour_type,
+                    'target_fish': target_fish,
+                }
+                for row in rows
+            ]
     
     def get_rods(self) -> List[Dict[str, Any]]:
         """Получить список всех удочек"""
@@ -2309,6 +2676,65 @@ class Database:
                 return False
             return bait_name.strip().lower() in suitable_list
 
+    def _upsert_ref_stars_stats(self, user_id: int, chat_id: int, received: int = 0, spent: int = 0, refunded: int = 0, withdrawn: int = 0) -> bool:
+        """Обновить агрегаты реф-звёзд для пары (user_id, chat_id)."""
+        if user_id is None or chat_id is None:
+            return False
+
+        try:
+            with self._connect() as conn:
+                cursor = conn.cursor()
+                if type(cursor).__module__.startswith('sqlite3'):
+                    cursor.execute(
+                        '''
+                        INSERT INTO ref_stars_stats (
+                            user_id, chat_id, stars_received, stars_spent, stars_refunded, stars_withdrawn, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        ON CONFLICT(user_id, chat_id) DO UPDATE SET
+                            stars_received = COALESCE(ref_stars_stats.stars_received, 0) + excluded.stars_received,
+                            stars_spent = COALESCE(ref_stars_stats.stars_spent, 0) + excluded.stars_spent,
+                            stars_refunded = COALESCE(ref_stars_stats.stars_refunded, 0) + excluded.stars_refunded,
+                            stars_withdrawn = COALESCE(ref_stars_stats.stars_withdrawn, 0) + excluded.stars_withdrawn,
+                            updated_at = CURRENT_TIMESTAMP
+                        ''',
+                        (int(user_id), int(chat_id), int(received), int(spent), int(refunded), int(withdrawn))
+                    )
+                else:
+                    cursor.execute(
+                        '''
+                        INSERT INTO ref_stars_stats (
+                            user_id, chat_id, stars_received, stars_spent, stars_refunded, stars_withdrawn, updated_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                        ON CONFLICT (user_id, chat_id) DO UPDATE SET
+                            stars_received = COALESCE(ref_stars_stats.stars_received, 0) + EXCLUDED.stars_received,
+                            stars_spent = COALESCE(ref_stars_stats.stars_spent, 0) + EXCLUDED.stars_spent,
+                            stars_refunded = COALESCE(ref_stars_stats.stars_refunded, 0) + EXCLUDED.stars_refunded,
+                            stars_withdrawn = COALESCE(ref_stars_stats.stars_withdrawn, 0) + EXCLUDED.stars_withdrawn,
+                            updated_at = CURRENT_TIMESTAMP
+                        ''',
+                        (int(user_id), int(chat_id), int(received), int(spent), int(refunded), int(withdrawn))
+                    )
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error("_upsert_ref_stars_stats error: %s", e)
+            return False
+
+    def _resolve_ref_user_for_chat(self, cursor, chat_id: int) -> Optional[int]:
+        """Определить владельца/рефера для чата через chat_configs.admin_user_id."""
+        try:
+            if type(cursor).__module__.startswith('sqlite3'):
+                cursor.execute('SELECT admin_user_id FROM chat_configs WHERE chat_id = ? LIMIT 1', (chat_id,))
+            else:
+                cursor.execute('SELECT admin_user_id FROM chat_configs WHERE chat_id = %s LIMIT 1', (chat_id,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            admin_user_id = int(row[0]) if row[0] is not None else None
+            return admin_user_id if admin_user_id and admin_user_id > 0 else None
+        except Exception:
+            return None
+
     def add_star_transaction(self, user_id: int, telegram_payment_charge_id: str, total_amount: int, refund_status: str = "none", chat_id: Optional[int] = None, chat_title: Optional[str] = None) -> bool:
         """Добавить запись о транзакции Telegram Stars"""
         if not telegram_payment_charge_id:
@@ -2342,12 +2768,25 @@ class Database:
         try:
             with self._connect() as conn:
                 cursor = conn.cursor()
-                # Ensure row exists
-                cursor.execute('INSERT OR IGNORE INTO chat_configs (chat_id, admin_user_id, is_configured, chat_title, stars_total) VALUES (?, ?, 1, ?, 0)', (chat_id, 0, chat_title))
-                # Update title if provided
-                if chat_title is not None:
-                    cursor.execute('UPDATE chat_configs SET chat_title = ? WHERE chat_id = ?', (chat_title, chat_id))
-                cursor.execute('UPDATE chat_configs SET stars_total = COALESCE(stars_total, 0) + ? WHERE chat_id = ?', (amount, chat_id))
+                is_sqlite = type(cursor).__module__.startswith('sqlite3')
+                if is_sqlite:
+                    cursor.execute('INSERT OR IGNORE INTO chat_configs (chat_id, admin_user_id, is_configured, chat_title, stars_total) VALUES (?, ?, 1, ?, 0)', (chat_id, 0, chat_title))
+                    if chat_title is not None:
+                        cursor.execute('UPDATE chat_configs SET chat_title = ? WHERE chat_id = ?', (chat_title, chat_id))
+                    cursor.execute('UPDATE chat_configs SET stars_total = COALESCE(stars_total, 0) + ? WHERE chat_id = ?', (amount, chat_id))
+                else:
+                    cursor.execute(
+                        'INSERT INTO chat_configs (chat_id, admin_user_id, is_configured, chat_title, stars_total) VALUES (%s, %s, 1, %s, 0) ON CONFLICT (chat_id) DO NOTHING',
+                        (chat_id, 0, chat_title)
+                    )
+                    if chat_title is not None:
+                        cursor.execute('UPDATE chat_configs SET chat_title = %s WHERE chat_id = %s', (chat_title, chat_id))
+                    cursor.execute('UPDATE chat_configs SET stars_total = COALESCE(stars_total, 0) + %s WHERE chat_id = %s', (amount, chat_id))
+
+                ref_user_id = self._resolve_ref_user_for_chat(cursor, chat_id)
+                if ref_user_id:
+                    self._upsert_ref_stars_stats(ref_user_id, chat_id, received=int(amount))
+
                 conn.commit()
                 return True
         except Exception as e:
@@ -2355,10 +2794,15 @@ class Database:
             return False
 
     def get_all_chat_stars(self) -> List[Dict[str, Any]]:
-        """Return list of chats with their title and total stars."""
+        """Return list of group/channel chats with title and total stars."""
         with self._connect() as conn:
             cursor = conn.cursor()
-            cursor.execute('SELECT chat_id, COALESCE(chat_title, "") as chat_title, COALESCE(stars_total,0) as stars_total FROM chat_configs ORDER BY stars_total DESC')
+            cursor.execute(
+                'SELECT chat_id, COALESCE(chat_title, "") as chat_title, COALESCE(stars_total,0) as stars_total '
+                'FROM chat_configs '
+                'WHERE chat_id < 0 '
+                'ORDER BY stars_total DESC'
+            )
             rows = cursor.fetchall()
             cols = [d[0] for d in cursor.description]
             return [dict(zip(cols, r)) for r in rows]
@@ -2395,11 +2839,45 @@ class Database:
             return False
         with self._connect() as conn:
             cursor = conn.cursor()
-            cursor.execute('''
-                UPDATE star_transactions
-                SET refund_status = ?
-                WHERE telegram_payment_charge_id = ?
-            ''', (refund_status, telegram_payment_charge_id))
+            is_sqlite = type(cursor).__module__.startswith('sqlite3')
+            if is_sqlite:
+                cursor.execute(
+                    'SELECT user_id, chat_id, total_amount, refund_status FROM star_transactions WHERE telegram_payment_charge_id = ? LIMIT 1',
+                    (telegram_payment_charge_id,)
+                )
+            else:
+                cursor.execute(
+                    'SELECT user_id, chat_id, total_amount, refund_status FROM star_transactions WHERE telegram_payment_charge_id = %s LIMIT 1',
+                    (telegram_payment_charge_id,)
+                )
+            prev = cursor.fetchone()
+
+            if is_sqlite:
+                cursor.execute('''
+                    UPDATE star_transactions
+                    SET refund_status = ?
+                    WHERE telegram_payment_charge_id = ?
+                ''', (refund_status, telegram_payment_charge_id))
+            else:
+                cursor.execute('''
+                    UPDATE star_transactions
+                    SET refund_status = %s
+                    WHERE telegram_payment_charge_id = %s
+                ''', (refund_status, telegram_payment_charge_id))
+
+            if cursor.rowcount > 0 and prev:
+                tx_user_id, tx_chat_id, tx_amount, prev_status = prev
+                new_status = (refund_status or '').strip().lower()
+                old_status = (prev_status or '').strip().lower()
+                if tx_chat_id is not None and new_status in {'ref', 'refunded'} and old_status not in {'ref', 'refunded'}:
+                    ref_user_id = self._resolve_ref_user_for_chat(cursor, int(tx_chat_id)) or tx_user_id
+                    if ref_user_id:
+                        self._upsert_ref_stars_stats(
+                            int(ref_user_id),
+                            int(tx_chat_id),
+                            spent=int(tx_amount or 0),
+                            refunded=int(tx_amount or 0)
+                        )
             conn.commit()
             return cursor.rowcount > 0
     
@@ -2593,10 +3071,16 @@ class Database:
             cursor = conn.cursor()
             
             # Проверяем, существует ли запись для этой удочки
-            cursor.execute('''
-                SELECT current_durability FROM player_rods 
-                WHERE user_id = %s AND (chat_id IS NULL OR chat_id < 1) AND rod_name = %s
-            ''', (user_id, rod_name))
+            if type(cursor).__module__.startswith('sqlite3'):
+                cursor.execute('''
+                    SELECT current_durability FROM player_rods 
+                    WHERE user_id = ? AND (chat_id IS NULL OR chat_id < 1) AND rod_name = ?
+                ''', (user_id, rod_name))
+            else:
+                cursor.execute('''
+                    SELECT current_durability FROM player_rods 
+                    WHERE user_id = %s AND (chat_id IS NULL OR chat_id < 1) AND rod_name = %s
+                ''', (user_id, rod_name))
             
             result = cursor.fetchone()
             if not result:
@@ -2604,11 +3088,18 @@ class Database:
                 self.init_player_rod(user_id, rod_name, chat_id=chat_id)
             
             # Уменьшаем прочность
-            cursor.execute('''
-                UPDATE player_rods 
-                SET current_durability = GREATEST(0, current_durability - %s)
-                WHERE user_id = %s AND (chat_id IS NULL OR chat_id < 1) AND rod_name = %s
-            ''', (damage, user_id, rod_name))
+            if type(cursor).__module__.startswith('sqlite3'):
+                cursor.execute('''
+                    UPDATE player_rods 
+                    SET current_durability = MAX(0, current_durability - ?)
+                    WHERE user_id = ? AND (chat_id IS NULL OR chat_id < 1) AND rod_name = ?
+                ''', (damage, user_id, rod_name))
+            else:
+                cursor.execute('''
+                    UPDATE player_rods 
+                    SET current_durability = GREATEST(0, current_durability - %s)
+                    WHERE user_id = %s AND (chat_id IS NULL OR chat_id < 1) AND rod_name = %s
+                ''', (damage, user_id, rod_name))
             conn.commit()
             
             # Запускаем процесс восстановления, если еще не запущен
@@ -2635,11 +3126,18 @@ class Database:
             return
         with self._connect() as conn:
             cursor = conn.cursor()
-            cursor.execute('''
-                UPDATE player_rods 
-                SET recovery_start_time = CURRENT_TIMESTAMP
-                WHERE user_id = %s AND (chat_id IS NULL OR chat_id < 1) AND rod_name = %s
-            ''', (user_id, rod_name))
+            if type(cursor).__module__.startswith('sqlite3'):
+                cursor.execute('''
+                    UPDATE player_rods 
+                    SET recovery_start_time = CURRENT_TIMESTAMP
+                    WHERE user_id = ? AND (chat_id IS NULL OR chat_id < 1) AND rod_name = ?
+                ''', (user_id, rod_name))
+            else:
+                cursor.execute('''
+                    UPDATE player_rods 
+                    SET recovery_start_time = CURRENT_TIMESTAMP
+                    WHERE user_id = %s AND (chat_id IS NULL OR chat_id < 1) AND rod_name = %s
+                ''', (user_id, rod_name))
             conn.commit()
 
     def recover_rod_durability(self, user_id: int, rod_name: str, recovery_amount: int, chat_id: int):
@@ -2921,6 +3419,172 @@ class Database:
         return int(remaining)
     
     # ===== РЕФЕРАЛЬНАЯ СИСТЕМА =====
+
+    def add_ref_access(self, user_id: int, chat_id: int) -> bool:
+        """Выдать пользователю доступ к реферальной статистике чата."""
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            if type(cursor).__module__.startswith('sqlite3'):
+                cursor.execute(
+                    'INSERT OR IGNORE INTO chat_configs (chat_id, admin_user_id, is_configured) VALUES (?, ?, 1)',
+                    (chat_id, user_id)
+                )
+            else:
+                cursor.execute(
+                    'INSERT INTO chat_configs (chat_id, admin_user_id, is_configured) VALUES (%s, %s, 1) ON CONFLICT (chat_id) DO UPDATE SET admin_user_id = EXCLUDED.admin_user_id, is_configured = 1',
+                    (chat_id, user_id)
+                )
+            self._upsert_ref_stars_stats(user_id, chat_id)
+            conn.commit()
+            return True
+
+    def get_ref_stars_stats(self, user_id: int, chat_id: int) -> Dict[str, int]:
+        """Получить агрегированную статистику по реф-звёздам для пары user/chat."""
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            if type(cursor).__module__.startswith('sqlite3'):
+                cursor.execute(
+                    '''
+                    SELECT
+                        COALESCE(stars_received, 0),
+                        COALESCE(stars_spent, 0),
+                        COALESCE(stars_refunded, 0),
+                        COALESCE(stars_withdrawn, 0)
+                    FROM ref_stars_stats
+                    WHERE user_id = ? AND chat_id = ?
+                    ''',
+                    (user_id, chat_id)
+                )
+            else:
+                cursor.execute(
+                    '''
+                    SELECT
+                        COALESCE(stars_received, 0),
+                        COALESCE(stars_spent, 0),
+                        COALESCE(stars_refunded, 0),
+                        COALESCE(stars_withdrawn, 0)
+                    FROM ref_stars_stats
+                    WHERE user_id = %s AND chat_id = %s
+                    ''',
+                    (user_id, chat_id)
+                )
+            row = cursor.fetchone()
+            if not row:
+                return {
+                    'stars_received': 0,
+                    'stars_spent': 0,
+                    'stars_refunded': 0,
+                    'stars_withdrawn': 0,
+                    'stars_available': 0,
+                }
+
+            received = int(row[0] or 0)
+            spent = int(row[1] or 0)
+            refunded = int(row[2] or 0)
+            withdrawn = int(row[3] or 0)
+            available = max(0, received - spent)
+            return {
+                'stars_received': received,
+                'stars_spent': spent,
+                'stars_refunded': refunded,
+                'stars_withdrawn': withdrawn,
+                'stars_available': available,
+            }
+
+    def get_ref_access_chats(self, user_id: int) -> List[int]:
+        """Список chat_id, где пользователь имеет доступ к реферальной статистике."""
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            if type(cursor).__module__.startswith('sqlite3'):
+                cursor.execute(
+                    'SELECT chat_id FROM chat_configs WHERE admin_user_id = ? AND is_configured = 1',
+                    (user_id,)
+                )
+            else:
+                cursor.execute(
+                    'SELECT chat_id FROM chat_configs WHERE admin_user_id = %s AND is_configured = 1',
+                    (user_id,)
+                )
+            rows = cursor.fetchall()
+            return [int(row[0]) for row in rows] if rows else []
+
+    def get_chat_title(self, chat_id: int) -> Optional[str]:
+        """Название чата из chat_configs."""
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            if type(cursor).__module__.startswith('sqlite3'):
+                cursor.execute('SELECT chat_title FROM chat_configs WHERE chat_id = ?', (chat_id,))
+            else:
+                cursor.execute('SELECT chat_title FROM chat_configs WHERE chat_id = %s', (chat_id,))
+            row = cursor.fetchone()
+            return row[0] if row and row[0] else None
+
+    def get_chat_stars_total(self, chat_id: int) -> int:
+        """Общее количество звёзд, пришедших от чата."""
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            if type(cursor).__module__.startswith('sqlite3'):
+                cursor.execute('SELECT COALESCE(stars_total, 0) FROM chat_configs WHERE chat_id = ?', (chat_id,))
+            else:
+                cursor.execute('SELECT COALESCE(stars_total, 0) FROM chat_configs WHERE chat_id = %s', (chat_id,))
+            row = cursor.fetchone()
+            return int(row[0]) if row else 0
+
+    def get_chat_refunds_total(self, chat_id: int) -> int:
+        """Сумма refund/withdraw для чата по транзакциям."""
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            if type(cursor).__module__.startswith('sqlite3'):
+                cursor.execute(
+                    "SELECT COALESCE(SUM(total_amount), 0) FROM star_transactions WHERE chat_id = ? AND refund_status IN ('approved', 'refunded', 'ref')",
+                    (chat_id,)
+                )
+            else:
+                cursor.execute(
+                    "SELECT COALESCE(SUM(total_amount), 0) FROM star_transactions WHERE chat_id = %s AND refund_status IN ('approved', 'refunded', 'ref')",
+                    (chat_id,)
+                )
+            row = cursor.fetchone()
+            return int(row[0]) if row else 0
+
+    def get_available_stars_for_withdraw(self, user_id: int, chat_id: int) -> int:
+        """Доступные к выводу звезды для чата (совместимый интерфейс с bot.py)."""
+        _ = user_id
+        total = self.get_chat_stars_total(chat_id)
+        refunded = self.get_chat_refunds_total(chat_id)
+        return max(0, total - refunded)
+
+    def get_withdrawn_stars(self, user_id: int, chat_id: int) -> int:
+        """Уже выведенные звезды для чата (совместимый интерфейс с bot.py)."""
+        _ = user_id
+        return self.get_chat_refunds_total(chat_id)
+
+    def mark_stars_withdrawn(self, user_id: int, amount: int, chat_id: Optional[int] = None, status: str = 'approved') -> bool:
+        """Записать факт вывода звёзд в транзакции."""
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            title = self.get_chat_title(chat_id) if chat_id is not None else None
+            if type(cursor).__module__.startswith('sqlite3'):
+                cursor.execute(
+                    "INSERT INTO star_transactions (user_id, telegram_payment_charge_id, total_amount, chat_id, chat_title, refund_status) VALUES (?, ?, ?, ?, ?, ?)",
+                    (user_id, f"withdraw_{user_id}_{int(datetime.now().timestamp())}", int(amount), chat_id, title, status)
+                )
+            else:
+                cursor.execute(
+                    "INSERT INTO star_transactions (user_id, telegram_payment_charge_id, total_amount, chat_id, chat_title, refund_status) VALUES (%s, %s, %s, %s, %s, %s)",
+                    (user_id, f"withdraw_{user_id}_{int(datetime.now().timestamp())}", int(amount), chat_id, title, status)
+                )
+
+            if chat_id is not None:
+                self._upsert_ref_stars_stats(
+                    int(user_id),
+                    int(chat_id),
+                    spent=int(amount),
+                    withdrawn=int(amount)
+                )
+
+            conn.commit()
+            return True
     
     def set_player_ref(self, user_id: int, chat_id: int, ref_user_id: int) -> bool:
         """Установить реферера для пользователя"""
@@ -3062,11 +3726,18 @@ class Database:
         """Получить все чаты, зарегистрированные этим юзером"""
         with self._connect() as conn:
             cursor = conn.cursor()
-            cursor.execute('''
-                SELECT chat_id, admin_ref_link, chat_invite_link
-                FROM chat_configs 
-                WHERE admin_user_id = %s AND is_configured = 1
-            ''', (user_id,))
+            if type(cursor).__module__.startswith('sqlite3'):
+                cursor.execute('''
+                    SELECT chat_id, admin_ref_link, chat_invite_link
+                    FROM chat_configs
+                    WHERE admin_user_id = ? AND is_configured = 1
+                ''', (user_id,))
+            else:
+                cursor.execute('''
+                    SELECT chat_id, admin_ref_link, chat_invite_link
+                    FROM chat_configs
+                    WHERE admin_user_id = %s AND is_configured = 1
+                ''', (user_id,))
             rows = cursor.fetchall()
             cols = [d[0] for d in cursor.description] if cursor.description else []
             return [dict(zip(cols, row)) for row in rows]

@@ -63,6 +63,25 @@ BOT_TOKEN=?
 pip install -r requirements.txt
 ```
 
+## ✅ Проверка перед деплоем
+
+Перед пушем/выкаткой выполните единый smoke-check совместимости БД:
+
+```bash
+python scripts/predeploy_db_check.py
+```
+
+Что проверяется:
+- `SQLite` (локальный тестовый режим) — всегда
+- `PostgreSQL` (серверный режим) — если задан `DATABASE_URL`
+
+Пример для сервера:
+
+```bash
+set DATABASE_URL=postgresql://user:password@host:5432/dbname
+python scripts/predeploy_db_check.py
+```
+
 ## 🎮 Функцииональность
 
 - 🎣 Рыбалка с сохранением в PostgreSQL
