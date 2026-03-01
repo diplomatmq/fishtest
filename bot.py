@@ -1251,7 +1251,8 @@ class FishBot:
             rarity_emoji = {
                 'Обычная': '⚪',
                 'Редкая': '🔵',
-                'Легендарная': '🟣'
+                'Легендарная': '🟣',
+                'Мифическая': '🔴'
             }
             fish_name_display = format_fish_name(fish['name'])
             
@@ -1760,6 +1761,7 @@ class FishBot:
             db.init_player_rod(user_id, BAMBOO_ROD, chat_id)
             db.update_player(user_id, chat_id, current_rod=BAMBOO_ROD)
             player = db.get_player(user_id, chat_id)
+        db.ensure_rod_catalog()
         all_rods = db.get_rods()
         
         keyboard = []
@@ -2381,7 +2383,8 @@ class FishBot:
             return
         
         await query.answer()
-        
+
+        db.ensure_rod_catalog()
         rods = db.get_rods()
         keyboard = []
         player = db.get_player(user_id, chat_id)
@@ -2389,6 +2392,9 @@ class FishBot:
         for rod in rods:
             # Гарпун только для 25+ уровня
             if rod['name'] == 'Гарпун' and player_level < 25:
+                continue
+            # Удачливая удочка только для 15+ уровня
+            if rod['name'] == 'Удачливая удочка' and player_level < 15:
                 continue
             keyboard.append([InlineKeyboardButton(
                 f"🎣 {rod['name']} - {rod['price']} 🪙",
@@ -2425,6 +2431,7 @@ class FishBot:
         rod_id = int(parts[2])
         
         await query.answer()
+        db.ensure_rod_catalog()
         
         # Получаем название удочки по ID
         rods = db.get_rods()
@@ -2436,6 +2443,15 @@ class FishBot:
         
         if not rod_name:
             await query.edit_message_text("❌ Удочка не найдена!")
+            return
+
+        player = db.get_player(user_id, chat_id)
+        player_level = int((player or {}).get('level', 0) or 0)
+        if rod_name == 'Удачливая удочка' and player_level < 15:
+            await query.edit_message_text("❌ Удачливая удочка открывается с 15 уровня.")
+            return
+        if rod_name == 'Гарпун' and player_level < 25:
+            await query.edit_message_text("❌ Гарпун открывается с 25 уровня.")
             return
         
         # Покупаем удочку
@@ -3491,7 +3507,8 @@ class FishBot:
         rarity_emoji = {
             'Обычная': '⚪',
             'Редкая': '🔵',
-            'Легендарная': '🟣'
+            'Легендарная': '🟣',
+            'Мифическая': '🔴'
         }
         for fish in page_fish:
             fish_name = fish.get('fish_name', '')
@@ -4194,7 +4211,7 @@ class FishBot:
                 return
 
             rarity = data.get('rarity')
-            if rarity == 'Легендарная' and qty < len(species_fish):
+            if rarity in ('Легендарная', 'Мифическая') and qty < len(species_fish):
                 items = sorted(species_fish, key=lambda f: float(f.get('weight') or 0), reverse=True)
                 lines = []
                 for idx, item in enumerate(items, 1):
@@ -4518,7 +4535,8 @@ class FishBot:
             rarity_emoji = {
                 'Обычная': '⚪',
                 'Редкая': '🔵',
-                'Легендарная': '🟣'
+                'Легендарная': '🟣',
+                'Мифическая': '🔴'
             }
             fish_name_display = format_fish_name(fish['name'])
             

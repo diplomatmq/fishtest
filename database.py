@@ -390,6 +390,7 @@ TEMP_ROD_RANGES = {
     "Углепластиковая удочка": (30, 70),
     "Карбоновая удочка": (50, 100),
     "Золотая удочка": (90, 150),
+    "Удачливая удочка": (150, 200),
 }
 
 LEVEL_XP_REQUIREMENTS = [
@@ -415,12 +416,14 @@ BASE_XP_BY_RARITY = {
     "Обычная": 5,
     "Редкая": 20,
     "Легендарная": 100,
+    "Мифическая": 180,
 }
 
 RARITY_XP_MULTIPLIERS = {
     "Обычная": 1.0,
     "Редкая": 1.1,
     "Легендарная": 1.2,
+    "Мифическая": 1.35,
 }
 
 class Database:
@@ -1187,13 +1190,37 @@ class Database:
                 ("Углепластиковая удочка", 1500, 150, 150, 5, 35),  # макс вес 35 кг
                 ("Карбоновая удочка", 4500, 200, 200, 10, 120),  # макс вес 120 кг
                 ("Золотая удочка", 15000, 300, 300, 20, 350),  # макс вес 350 кг
+                ("Удачливая удочка", 25000, 350, 350, 25, 580),  # + шанс NFT, макс вес 580 кг
                 ("Гарпун", 75000, 100, 100, 0, 10000),  # гарпун: макс вес 10 тонн, мин. 150 кг (логика в game)
             ]
             
             cursor.executemany('''
-                INSERT OR IGNORE INTO rods (name, price, durability, max_durability, fish_bonus, max_weight)
+                INSERT OR REPLACE INTO rods (name, price, durability, max_durability, fish_bonus, max_weight)
                 VALUES (?, ?, ?, ?, ?, ?)
             ''', rods_data)
+
+            # Fallback sync by name (важно для БД, где id не auto-increment по умолчанию)
+            for rod_name, rod_price, rod_durability, rod_max_durability, rod_bonus, rod_max_weight in rods_data:
+                cursor.execute(
+                    '''
+                    UPDATE rods
+                    SET price = ?, durability = ?, max_durability = ?, fish_bonus = ?, max_weight = ?
+                    WHERE name = ?
+                    ''',
+                    (rod_price, rod_durability, rod_max_durability, rod_bonus, rod_max_weight, rod_name)
+                )
+
+                if cursor.rowcount == 0:
+                    cursor.execute('SELECT COALESCE(MAX(id), 0) + 1 FROM rods')
+                    next_id_row = cursor.fetchone()
+                    next_id = int(next_id_row[0]) if next_id_row and next_id_row[0] is not None else 1
+                    cursor.execute(
+                        '''
+                        INSERT INTO rods (id, name, price, durability, max_durability, fish_bonus, max_weight)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ''',
+                        (next_id, rod_name, rod_price, rod_durability, rod_max_durability, rod_bonus, rod_max_weight)
+                    )
             
             # Добавление локаций
             locations_data = [
@@ -1375,9 +1402,129 @@ class Database:
                 ("Белая акула", "Легендарная", 50.0, 300.0, 200, 500, 900, "Море", "Лето", "Туша рыбы,Крупный живец,Кусок мяса,Крупный кусок мяса,Кальмар,Спрут", 80, None),
             ]
 
-            from fish_stickers import FISH_INFO
+            from fish_stickers import FISH_INFO, FISH_STICKERS
 
             bait_name_map = {name.lower(): name for name, _, _, _ in base_baits_data}
+            fish_sticker_map = {name.strip(): sticker for name, sticker in FISH_STICKERS.items() if name and name.strip()}
+            existing_fish_names = {entry[0].strip() for entry in fish_data if entry and entry[0]}
+
+            rarity_map = {
+                "обычная": "Обычная",
+                "часто": "Обычная",
+                "очень часто": "Обычная",
+                "редкая": "Редкая",
+                "очень редкая": "Легендарная",
+                "легендарная": "Легендарная",
+                "мифическая": "Мифическая",
+            }
+
+            mythic_keywords = [
+                "белая акула",
+                "белуга",
+                "калуга",
+                "лисья акула",
+                "рыба-луна",
+                "луна-рыба",
+                "морской петух",
+                "морской черт",
+                "скат-хвостокол",
+                "барракуда",
+                "тигровая акула",
+            ]
+
+            def is_mythic_fish_name(name_value: str) -> bool:
+                norm = (name_value or "").strip().lower().replace('ё', 'е')
+                if not norm:
+                    return False
+                for keyword in mythic_keywords:
+                    if keyword in norm:
+                        return True
+                return False
+
+            def parse_range(raw_value: str, default_min: float, default_max: float, unit: str) -> tuple[float, float]:
+                if not raw_value:
+                    return default_min, default_max
+                text = str(raw_value).lower().replace(unit, '').replace(' ', '')
+                parts = text.split('-')
+                if len(parts) != 2:
+                    return default_min, default_max
+                try:
+                    min_v = float(parts[0].replace(',', '.'))
+                    max_v = float(parts[1].replace(',', '.'))
+                    if max_v < min_v:
+                        min_v, max_v = max_v, min_v
+                    return min_v, max_v
+                except Exception:
+                    return default_min, default_max
+
+            def infer_locations_from_habitat(habitat_value: str) -> str:
+                text = (habitat_value or '').lower()
+                locations: List[str] = []
+                if 'пруд' in text:
+                    locations.append('Городской пруд')
+                if 'рек' in text:
+                    locations.append('Река')
+                if 'озер' in text or 'озёр' in text:
+                    locations.append('Озеро')
+                if 'мор' in text:
+                    locations.append('Море')
+                if not locations:
+                    return 'Река,Озеро'
+                # удаление дублей с сохранением порядка
+                uniq: List[str] = []
+                for loc in locations:
+                    if loc not in uniq:
+                        uniq.append(loc)
+                return ','.join(uniq)
+
+            def default_price_for_rarity(rarity_value: str) -> int:
+                if rarity_value == 'Мифическая':
+                    return 650
+                if rarity_value == 'Легендарная':
+                    return 260
+                if rarity_value == 'Редкая':
+                    return 70
+                return 18
+
+            # Автодобавление всех отсутствующих видов из fish_stickers,
+            # чтобы они были в таблице fish и реально ловились.
+            for fish_name, sticker_filename in fish_sticker_map.items():
+                fish_name = fish_name.strip()
+                if not fish_name or fish_name == 'Рыбнадзор' or fish_name in existing_fish_names:
+                    continue
+
+                info = FISH_INFO.get(fish_name, {})
+                rarity_raw = str(info.get('rarity', 'Редкая')).strip().lower()
+                rarity = rarity_map.get(rarity_raw, 'Редкая')
+                if is_mythic_fish_name(fish_name):
+                    rarity = 'Мифическая'
+
+                min_weight, max_weight = parse_range(str(info.get('weight_range', '')), 0.3, 3.5, 'кг')
+                min_length, max_length = parse_range(str(info.get('size_range', '')), 20.0, 65.0, 'см')
+
+                locations = infer_locations_from_habitat(str(info.get('habitat', '')))
+                seasons = str(info.get('seasons', 'Все'))
+                suitable_baits = str(info.get('nutrition', 'Все'))
+
+                price = default_price_for_rarity(rarity)
+                max_rod_weight = max(10, int(max_weight * 1.5))
+                required_level = 0 if rarity == 'Обычная' else (10 if rarity == 'Редкая' else (20 if rarity == 'Легендарная' else 30))
+
+                fish_data.append((
+                    fish_name,
+                    rarity,
+                    min_weight,
+                    max_weight,
+                    min_length,
+                    max_length,
+                    price,
+                    locations,
+                    seasons,
+                    suitable_baits,
+                    max_rod_weight,
+                    sticker_filename,
+                ))
+                existing_fish_names.add(fish_name)
 
             def normalize_seasons(seasons_value: str) -> str:
                 if not seasons_value:
@@ -1402,13 +1549,22 @@ class Database:
 
             normalized_fish_data = []
             for entry in fish_data:
-                (name, rarity, min_weight, max_weight, min_length, max_length, price,
-                 locations, seasons, suitable_baits, max_rod_weight, sticker_id) = entry
-                required_level = 0
+                if len(entry) == 13:
+                    (name, rarity, min_weight, max_weight, min_length, max_length, price,
+                     locations, seasons, suitable_baits, max_rod_weight, required_level, sticker_id) = entry
+                else:
+                    (name, rarity, min_weight, max_weight, min_length, max_length, price,
+                     locations, seasons, suitable_baits, max_rod_weight, sticker_id) = entry
+                    required_level = 0
                 info = FISH_INFO.get(name)
+                if not sticker_id:
+                    sticker_id = fish_sticker_map.get(name)
                 if info:
                     seasons = normalize_seasons(info.get("seasons", ""))
                     suitable_baits = normalize_baits(info.get("nutrition", ""))
+                if is_mythic_fish_name(name):
+                    rarity = 'Мифическая'
+                    required_level = max(int(required_level or 0), 30)
                 normalized_fish_data.append((
                     name, rarity, min_weight, max_weight, min_length, max_length, price,
                     locations, seasons, suitable_baits, max_rod_weight, required_level, sticker_id
@@ -1938,6 +2094,41 @@ class Database:
                 return None
             columns = [description[0] for description in cursor.description]
             return dict(zip(columns, row))
+
+    def ensure_rod_catalog(self) -> None:
+        """Гарантировать наличие ключевых удочек в каталоге rods."""
+        rods_data = [
+            ("Бамбуковая удочка", 0, 100, 100, 0, 20),
+            ("Углепластиковая удочка", 1500, 150, 150, 5, 35),
+            ("Карбоновая удочка", 4500, 200, 200, 10, 120),
+            ("Золотая удочка", 15000, 300, 300, 20, 350),
+            ("Удачливая удочка", 25000, 350, 350, 25, 580),
+            ("Гарпун", 75000, 100, 100, 0, 10000),
+        ]
+
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            for rod_name, rod_price, rod_durability, rod_max_durability, rod_bonus, rod_max_weight in rods_data:
+                cursor.execute(
+                    '''
+                    UPDATE rods
+                    SET price = ?, durability = ?, max_durability = ?, fish_bonus = ?, max_weight = ?
+                    WHERE name = ?
+                    ''',
+                    (rod_price, rod_durability, rod_max_durability, rod_bonus, rod_max_weight, rod_name)
+                )
+                if cursor.rowcount == 0:
+                    cursor.execute('SELECT COALESCE(MAX(id), 0) + 1 FROM rods')
+                    next_id_row = cursor.fetchone()
+                    next_id = int(next_id_row[0]) if next_id_row and next_id_row[0] is not None else 1
+                    cursor.execute(
+                        '''
+                        INSERT INTO rods (id, name, price, durability, max_durability, fish_bonus, max_weight)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ''',
+                        (next_id, rod_name, rod_price, rod_durability, rod_max_durability, rod_bonus, rod_max_weight)
+                    )
+            conn.commit()
     
     def get_rod_by_id(self, rod_id: int) -> Optional[Dict[str, Any]]:
         """Получить информацию об удочке по ID"""
@@ -2243,6 +2434,7 @@ class Database:
             'Обычная': 1.15,
             'Редкая': 1.5,
             'Легендарная': 2.2,
+            'Мифическая': 3.0,
         }
         rarity_multiplier = rarity_multipliers.get(rarity, 1.0)
 
@@ -2361,6 +2553,7 @@ class Database:
             'Обычная': 60.0,
             'Редкая': 30.0,
             'Легендарная': 10.0,
+            'Мифическая': 5.0,
             'Мусор': 5.0,
         }
         weights: List[float] = []
