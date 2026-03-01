@@ -110,6 +110,39 @@ STAR_EMOJI_TAG = '<tg-emoji emoji-id="5463289097336405244">⭐</tg-emoji>'
 LOCATION_EMOJI_TAG = '<tg-emoji emoji-id="5821128296217185461">📍</tg-emoji>'
 PARTY_EMOJI_TAG = '<tg-emoji emoji-id="5436040291507247633">🎉</tg-emoji>'
 
+HARPOON_NAME = "Гарпун"
+HARPOON_COOLDOWN_MINUTES = 20
+HARPOON_SKIP_COST_STARS = 2
+ECHOSOUNDER_CODE = "echosounder"
+ECHOSOUNDER_COST_STARS = 20
+ECHOSOUNDER_DURATION_HOURS = 24
+FEEDER_ITEMS = [
+    {
+        "code": "feeder_5",
+        "name": "Кормушка базовая",
+        "bonus": 5,
+        "duration_minutes": 60,
+        "price_coins": 3000,
+        "price_stars": 0,
+    },
+    {
+        "code": "feeder_7",
+        "name": "Кормушка усиленная",
+        "bonus": 7,
+        "duration_minutes": 60,
+        "price_coins": 5000,
+        "price_stars": 0,
+    },
+    {
+        "code": "feeder_10",
+        "name": "Кормушка звёздная",
+        "bonus": 10,
+        "duration_minutes": 60,
+        "price_coins": 0,
+        "price_stars": 10,
+    },
+]
+
 def replace_coin_emoji(text: str) -> str:
     if not text:
         return text
@@ -554,6 +587,110 @@ class FishBot:
             "created_ts": created_ts,
             "location": location,
         }
+
+    def _build_harpoon_skip_payload(self, user_id: int, chat_id: int) -> str:
+        return f"harpoon_skip_{user_id}_{chat_id}_{int(datetime.now().timestamp())}"
+
+    def _parse_harpoon_skip_payload(self, payload: str) -> Optional[Dict[str, int]]:
+        if not payload or not payload.startswith("harpoon_skip_"):
+            return None
+
+        body = payload[len("harpoon_skip_"):]
+        parts = body.rsplit("_", 2)
+        if len(parts) != 3:
+            return None
+
+        user_part, chat_part, ts_part = parts
+        try:
+            return {
+                "payload_user_id": int(user_part),
+                "group_chat_id": int(chat_part),
+                "created_ts": int(ts_part),
+            }
+        except (TypeError, ValueError):
+            return None
+
+    def _build_booster_payload(self, booster_code: str, user_id: int, chat_id: int) -> str:
+        return f"booster_{booster_code}_{user_id}_{chat_id}_{int(datetime.now().timestamp())}"
+
+    def _parse_booster_payload(self, payload: str) -> Optional[Dict[str, Any]]:
+        if not payload or not payload.startswith("booster_"):
+            return None
+
+        body = payload[len("booster_"):]
+        parts = body.rsplit("_", 3)
+        if len(parts) != 4:
+            return None
+
+        booster_code, user_part, chat_part, ts_part = parts
+        try:
+            return {
+                "booster_code": booster_code,
+                "payload_user_id": int(user_part),
+                "group_chat_id": int(chat_part),
+                "created_ts": int(ts_part),
+            }
+        except (TypeError, ValueError):
+            return None
+
+    def _get_feeder_by_code(self, feeder_code: str) -> Optional[Dict[str, Any]]:
+        for item in FEEDER_ITEMS:
+            if item["code"] == feeder_code:
+                return item
+        return None
+
+    def _format_seconds_compact(self, seconds: int) -> str:
+        total = max(0, int(seconds))
+        minutes, sec = divmod(total, 60)
+        hours, minutes = divmod(minutes, 60)
+        if hours > 0:
+            return f"{hours}ч {minutes}м {sec}с"
+        return f"{minutes}м {sec}с"
+
+    async def _execute_harpoon_catch(self, user_id: int, group_chat_id: int, reply_to_message_id: Optional[int] = None) -> None:
+        player = db.get_player(user_id, group_chat_id)
+        if not player:
+            await self._safe_send_message(
+                chat_id=group_chat_id,
+                text="❌ Профиль не найден. Используйте /start в этом чате.",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return
+
+        location = player.get('current_location') or "Городской пруд"
+        result = game.fish_with_harpoon(user_id, group_chat_id, location)
+
+        db.mark_harpoon_used(user_id, group_chat_id)
+
+        if not result.get("success"):
+            await self._safe_send_message(
+                chat_id=group_chat_id,
+                text=result.get("message", "❌ Гарпун не сработал."),
+                reply_to_message_id=reply_to_message_id,
+            )
+            return
+
+        fish = result.get('fish') or {}
+        weight = result.get('weight', 0)
+        length = result.get('length', 0)
+        fish_name = fish.get('name', 'Неизвестная рыба')
+        fish_price = db.calculate_fish_price(fish, weight, length) if fish else 0
+
+        fish_name_display = format_fish_name(fish_name)
+        message = (
+            f"🗡️ Гарпун сработал!\n\n"
+            f"🐟 {fish_name_display}\n"
+            f"📏 Размер: {length}см | Вес: {weight} кг\n"
+            f"💰 Стоимость: {fish_price} 🪙\n"
+            f"📍 Место: {result.get('location', location)}\n"
+            f"⭐ Редкость: {fish.get('rarity', 'Обычная')}"
+        )
+
+        await self._safe_send_message(
+            chat_id=group_chat_id,
+            text=message,
+            reply_to_message_id=reply_to_message_id,
+        )
 
     async def _create_guaranteed_invoice_url(self, user_id: int, chat_id: int) -> Optional[str]:
         """Создать ссылку инвойса для гарантированного улова."""
@@ -1414,6 +1551,12 @@ class FishBot:
             "🕸️ Выбрать сеть",
             callback_data=f"select_net_{user_id}"
         )])
+
+        if db.is_echosounder_active(user_id, chat_id):
+            keyboard.append([InlineKeyboardButton(
+                "📡 Эхолот",
+                callback_data=f"show_echosounder_{user_id}"
+            )])
         
         keyboard.append([InlineKeyboardButton("🔙 Меню", callback_data=f"back_to_menu_{user_id}")])
         
@@ -1433,6 +1576,73 @@ class FishBot:
                     )
                 except Exception as e2:
                     logger.error(f"Failed to send change_bait menu: {e2}")
+
+    async def handle_show_echosounder(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показать лучший клёв по погоде и ориентир по наживке/рыбе."""
+        query = update.callback_query
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+
+        if not query.data.endswith(f"_{user_id}"):
+            await query.answer("Эта кнопка не для вас", show_alert=True)
+            return
+
+        if not db.is_echosounder_active(user_id, chat_id):
+            await query.answer("Эхолот не активен. Купите его в магазине.", show_alert=True)
+            return
+
+        locations = db.get_locations()
+        if not locations:
+            await query.answer("Локации не найдены.", show_alert=True)
+            return
+
+        best_location = None
+        best_bonus = -999
+        best_condition = ""
+
+        for loc in locations:
+            loc_name = loc.get('name')
+            if not loc_name:
+                continue
+            weather = db.get_or_update_weather(loc_name)
+            condition = weather.get('condition', 'Ясно') if weather else 'Ясно'
+            bonus = weather_system.get_weather_bonus(condition)
+            if bonus > best_bonus:
+                best_bonus = bonus
+                best_location = loc_name
+                best_condition = condition
+
+        if not best_location:
+            await query.answer("Не удалось рассчитать лучший клёв.", show_alert=True)
+            return
+
+        season = get_current_season()
+        fish_list = db.get_fish_by_location(best_location, season, min_level=999)
+        top_fish = None
+        if fish_list:
+            top_fish = max(fish_list, key=lambda item: float(item.get('max_weight') or 0))
+
+        if top_fish:
+            fish_name = str(top_fish.get('name', 'Неизвестно'))
+            max_weight = float(top_fish.get('max_weight') or 0)
+            suitable = str(top_fish.get('suitable_baits') or 'Все')
+            if suitable.strip().lower() == 'все':
+                bait_tip = "Любая"
+            else:
+                bait_tip = suitable.split(',')[0].strip()
+        else:
+            fish_name = "нет данных"
+            max_weight = 0
+            bait_tip = "Любая"
+
+        alert_text = (
+            f"Лучшая локация: {best_location} ({best_condition}, {best_bonus:+d}%). "
+            f"Макс рыба: {fish_name} до {max_weight:.1f}кг. Наживка: {bait_tip}."
+        )
+        if len(alert_text) > 200:
+            alert_text = alert_text[:197] + "..."
+
+        await query.answer(alert_text, show_alert=True)
     
     async def handle_change_bait_location(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показать наживки игрока для выбранной локации"""
@@ -1546,6 +1756,10 @@ class FishBot:
         await query.answer()
         
         player = db.get_player(user_id, chat_id)
+        if player and player.get('current_rod') == HARPOON_NAME:
+            db.init_player_rod(user_id, BAMBOO_ROD, chat_id)
+            db.update_player(user_id, chat_id, current_rod=BAMBOO_ROD)
+            player = db.get_player(user_id, chat_id)
         all_rods = db.get_rods()
         
         keyboard = []
@@ -1564,7 +1778,10 @@ class FishBot:
         
         # Добавляем остальные удочки
         for rod in all_rods:
-            if rod['name'] != "Бамбуковая удочка":  # Исключаем, так как уже выше добавили
+            if rod['name'] not in ("Бамбуковая удочка", HARPOON_NAME):  # Исключаем стартовую и гарпун (он отдельный инструмент)
+                owned_rod = db.get_player_rod(user_id, rod['name'], chat_id)
+                if not owned_rod:
+                    continue
                 current = "✅" if player['current_rod'] == rod['name'] else ""
                 # Получаем текущую прочность удочки
                 durability_str = ""
@@ -1581,11 +1798,25 @@ class FishBot:
                     f"🎣 {rod['name']}{durability_str} {current}",
                     callback_data=cb_data
                 )])
+
+        # Гарпун отдельным инструментом (не как удочка)
+        harpoon_owned = db.get_player_rod(user_id, HARPOON_NAME, chat_id)
+        if harpoon_owned:
+            remaining = db.get_harpoon_cooldown_remaining(user_id, chat_id, HARPOON_COOLDOWN_MINUTES)
+            if remaining > 0:
+                harpoon_status = f"⏳ {self._format_seconds_compact(remaining)}"
+            else:
+                harpoon_status = "✅ Готов"
+
+            keyboard.append([InlineKeyboardButton(
+                f"🗡️ {HARPOON_NAME} ({harpoon_status})",
+                callback_data=f"use_harpoon_{user_id}"
+            )])
         
         keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data=f"change_bait_{user_id}")])
         
         reply_markup = InlineKeyboardMarkup(keyboard)
-        message = "🎣 Выберите удочку:"
+        message = "🎣 Выберите удочку:\n\n🗡️ Гарпун теперь используется отдельно и не влияет на выбор удочки."
         
         try:
             await query.edit_message_text(message, reply_markup=reply_markup)
@@ -1795,10 +2026,12 @@ class FishBot:
         # Вытаскиваем случайные рыбы и мусор
         catch_results = []
         total_value = 0
+        feeder_bonus = db.get_active_feeder_bonus(user_id, chat_id)
+        fish_chance = min(95, 80 + feeder_bonus)
         
         for i in range(fish_count):
-            # 80% шанс рыбы, 20% шанс мусора
-            is_trash = random.randint(1, 100) <= 20
+            # Базово 80% шанс рыбы, кормушка увеличивает шанс
+            is_trash = random.randint(1, 100) > fish_chance
             
             if is_trash and available_trash:
                 # Ловим мусор
@@ -1872,6 +2105,8 @@ class FishBot:
         
         message += "─" * 30 + "\n"
         message += f"💰 Итого: {total_value} {COIN_NAME}\n"
+        if feeder_bonus > 0:
+            message += f"🧺 Бонус кормушки: +{feeder_bonus}% (рыба {fish_chance}%)\n"
         
         # Обновляем оставшиеся использования
         player_net = db.get_player_net(user_id, net_name, chat_id)
@@ -1922,6 +2157,13 @@ class FishBot:
         if not rod_name:
             await query.edit_message_text("❌ Удочка не найдена!")
             return
+
+        if rod_name == HARPOON_NAME:
+            await query.edit_message_text(
+                "🗡️ Гарпун больше не выбирается как удочка.\n"
+                "Используйте кнопку гарпуна в меню выбора удочки."
+            )
+            return
         
         # Проверяем, что удочка есть у игрока (или бамбуковая)
         if rod_name != "Бамбуковая удочка":
@@ -1942,6 +2184,95 @@ class FishBot:
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.edit_message_text(f"✅ Удочка '{rod_name}' выбрана!", reply_markup=reply_markup)
+
+    async def handle_use_harpoon(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Использование гарпуна как отдельного инструмента."""
+        query = update.callback_query
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+
+        if not query.data.endswith(f"_{user_id}"):
+            await query.answer("Эта кнопка не для вас", show_alert=True)
+            return
+
+        await query.answer()
+
+        harpoon_owned = db.get_player_rod(user_id, HARPOON_NAME, chat_id)
+        if not harpoon_owned:
+            await query.edit_message_text(
+                "❌ У вас нет гарпуна. Купите его в магазине.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Магазин", callback_data=f"shop_rods_{user_id}")]])
+            )
+            return
+
+        remaining = db.get_harpoon_cooldown_remaining(user_id, chat_id, HARPOON_COOLDOWN_MINUTES)
+        if remaining > 0:
+            keyboard = [
+                [InlineKeyboardButton(
+                    f"⭐ Пропустить КД за {HARPOON_SKIP_COST_STARS} Stars",
+                    callback_data=f"use_harpoon_paid_{user_id}"
+                )],
+                [InlineKeyboardButton("🔙 Назад", callback_data=f"change_rod_{user_id}")]
+            ]
+            await query.edit_message_text(
+                (
+                    f"🗡️ Гарпун на перезарядке: {self._format_seconds_compact(remaining)}\n\n"
+                    f"Можно подождать {HARPOON_COOLDOWN_MINUTES} минут или оплатить {HARPOON_SKIP_COST_STARS} Telegram Stars.\n"
+                    "Пока идет КД гарпуна, вы можете спокойно рыбачить обычной удочкой."
+                ),
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+
+        await self._execute_harpoon_catch(user_id, chat_id, reply_to_message_id=query.message.message_id)
+
+    async def handle_use_harpoon_paid(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Оплата пропуска КД гарпуна через Telegram Stars."""
+        query = update.callback_query
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+
+        if not query.data.endswith(f"_{user_id}"):
+            await query.answer("Эта кнопка не для вас", show_alert=True)
+            return
+
+        await query.answer()
+
+        harpoon_owned = db.get_player_rod(user_id, HARPOON_NAME, chat_id)
+        if not harpoon_owned:
+            await query.edit_message_text("❌ У вас нет гарпуна. Купите его в магазине.")
+            return
+
+        remaining = db.get_harpoon_cooldown_remaining(user_id, chat_id, HARPOON_COOLDOWN_MINUTES)
+        if remaining <= 0:
+            await self._execute_harpoon_catch(user_id, chat_id, reply_to_message_id=query.message.message_id)
+            return
+
+        from config import BOT_TOKEN, STAR_NAME
+        tg_api = TelegramBotAPI(BOT_TOKEN)
+        payload = self._build_harpoon_skip_payload(user_id, chat_id)
+
+        invoice_url = await tg_api.create_invoice_link(
+            title="Пропуск КД гарпуна",
+            description=f"Мгновенное использование гарпуна без ожидания ({HARPOON_SKIP_COST_STARS} {STAR_NAME})",
+            payload=payload,
+            currency="XTR",
+            prices=[{"label": "Пропуск КД гарпуна", "amount": HARPOON_SKIP_COST_STARS}],
+        )
+
+        if not invoice_url:
+            await query.edit_message_text("❌ Не удалось создать ссылку оплаты. Попробуйте позже.")
+            return
+
+        await self.send_invoice_url_button(
+            chat_id=chat_id,
+            invoice_url=invoice_url,
+            text=f"⭐ Оплатите {HARPOON_SKIP_COST_STARS} Telegram Stars для мгновенного использования гарпуна.",
+            user_id=user_id,
+            timeout_sec=600,
+        )
+
+        await query.edit_message_text("Ссылка на оплату отправлена. После оплаты гарпун сработает автоматически.")
 
     async def handle_instant_repair(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка мгновенного ремонта удочки"""
@@ -2338,6 +2669,225 @@ class FishBot:
         except Exception as e:
             if "Message is not modified" not in str(e):
                 logger.error(f"Ошибка редактирования магазина сетей: {e}")
+
+    async def handle_shop_feeders(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Магазин кормушек и эхолота."""
+        query = update.callback_query
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+
+        if not query.data.endswith(f"_{user_id}"):
+            await query.answer("Эта кнопка не для вас", show_alert=True)
+            return
+
+        await query.answer()
+
+        player = db.get_player(user_id, chat_id)
+        if not player:
+            await query.edit_message_text("❌ Профиль не найден. Используйте /start")
+            return
+
+        active_feeder = db.get_active_feeder(user_id, chat_id)
+        feeder_remaining = db.get_feeder_cooldown_remaining(user_id, chat_id)
+        echosounder_remaining = db.get_echosounder_remaining_seconds(user_id, chat_id)
+
+        keyboard = []
+        for feeder in FEEDER_ITEMS:
+            if feeder["price_stars"] > 0:
+                price_label = f"{feeder['price_stars']} ⭐"
+                callback_data = f"buy_feeder_stars_{feeder['code']}_{user_id}"
+            else:
+                price_label = f"{feeder['price_coins']} 🪙"
+                callback_data = f"buy_feeder_coins_{feeder['code']}_{user_id}"
+
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"🧺 {feeder['name']} (+{feeder['bonus']}% на 1ч) — {price_label}",
+                    callback_data=callback_data,
+                )
+            ])
+
+        keyboard.append([
+            InlineKeyboardButton(
+                f"📡 Эхолот (24ч) — {ECHOSOUNDER_COST_STARS} ⭐",
+                callback_data=f"buy_echosounder_{user_id}",
+            )
+        ])
+        keyboard.append([InlineKeyboardButton("🔙 Магазин", callback_data=f"shop_{user_id}")])
+
+        status_lines = [f"💰 Баланс: {player.get('coins', 0)} 🪙"]
+        if active_feeder:
+            status_lines.append(
+                f"🧺 Активна: +{active_feeder['bonus_percent']}% ({self._format_seconds_compact(feeder_remaining)})"
+            )
+        else:
+            status_lines.append("🧺 Кормушка не активна")
+
+        if echosounder_remaining > 0:
+            status_lines.append(f"📡 Эхолот активен: {self._format_seconds_compact(echosounder_remaining)}")
+        else:
+            status_lines.append("📡 Эхолот не активен")
+
+        message = (
+            "🛒 Кормушки и эхолот\n\n"
+            "Кормушка усиливает клёв для обычных, платных и сетевых забросов.\n"
+            "Пока активна одна кормушка — другие купить нельзя.\n\n"
+            + "\n".join(status_lines)
+        )
+
+        await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    async def handle_buy_feeder_coins(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Покупка кормушки за монеты."""
+        query = update.callback_query
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+
+        if not query.data.endswith(f"_{user_id}"):
+            await query.answer("Эта кнопка не для вас", show_alert=True)
+            return
+
+        await query.answer()
+
+        feeder_code = query.data.replace("buy_feeder_coins_", "").replace(f"_{user_id}", "")
+        feeder = self._get_feeder_by_code(feeder_code)
+        if not feeder or feeder.get("price_coins", 0) <= 0:
+            await query.edit_message_text("❌ Кормушка не найдена.")
+            return
+
+        active_feeder = db.get_active_feeder(user_id, chat_id)
+        if active_feeder:
+            remaining = db.get_feeder_cooldown_remaining(user_id, chat_id)
+            await query.answer(
+                f"Сначала дождитесь окончания активной кормушки ({self._format_seconds_compact(remaining)})",
+                show_alert=True,
+            )
+            return
+
+        player = db.get_player(user_id, chat_id)
+        if not player:
+            await query.edit_message_text("❌ Профиль не найден.")
+            return
+
+        price = int(feeder["price_coins"])
+        if int(player.get("coins", 0)) < price:
+            await query.edit_message_text(
+                f"❌ Недостаточно монет. Нужно: {price} 🪙, у вас: {player.get('coins', 0)} 🪙"
+            )
+            return
+
+        db.update_player(user_id, chat_id, coins=int(player.get("coins", 0)) - price)
+        db.activate_feeder(
+            user_id,
+            chat_id,
+            feeder_type=feeder["code"],
+            bonus_percent=int(feeder["bonus"]),
+            duration_minutes=int(feeder["duration_minutes"]),
+        )
+
+        await query.edit_message_text(
+            f"✅ {feeder['name']} активирована на 1 час.\n"
+            f"🎯 Бонус к клёву: +{feeder['bonus']}%\n"
+            f"💰 Потрачено: {price} 🪙"
+        )
+
+    async def handle_buy_feeder_stars(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Покупка кормушки за Telegram Stars (через инвойс)."""
+        query = update.callback_query
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+
+        if not query.data.endswith(f"_{user_id}"):
+            await query.answer("Эта кнопка не для вас", show_alert=True)
+            return
+
+        await query.answer()
+
+        feeder_code = query.data.replace("buy_feeder_stars_", "").replace(f"_{user_id}", "")
+        feeder = self._get_feeder_by_code(feeder_code)
+        if not feeder or feeder.get("price_stars", 0) <= 0:
+            await query.edit_message_text("❌ Кормушка не найдена.")
+            return
+
+        active_feeder = db.get_active_feeder(user_id, chat_id)
+        if active_feeder:
+            remaining = db.get_feeder_cooldown_remaining(user_id, chat_id)
+            await query.answer(
+                f"Сначала дождитесь окончания активной кормушки ({self._format_seconds_compact(remaining)})",
+                show_alert=True,
+            )
+            return
+
+        tg_api = TelegramBotAPI(BOT_TOKEN)
+        payload = self._build_booster_payload(feeder["code"], user_id, chat_id)
+        invoice_url = await tg_api.create_invoice_link(
+            title=feeder["name"],
+            description=f"Активация кормушки +{feeder['bonus']}% на 1 час",
+            payload=payload,
+            currency="XTR",
+            prices=[{"label": feeder["name"], "amount": int(feeder["price_stars"])}],
+        )
+
+        if not invoice_url:
+            await query.edit_message_text("❌ Не удалось создать ссылку оплаты. Попробуйте позже.")
+            return
+
+        await self.send_invoice_url_button(
+            chat_id=chat_id,
+            invoice_url=invoice_url,
+            text=(
+                f"⭐ Оплатите {feeder['price_stars']} Telegram Stars для активации {feeder['name']} "
+                f"(+{feeder['bonus']}% на 1 час)."
+            ),
+            user_id=user_id,
+            timeout_sec=900,
+        )
+
+        await query.edit_message_text("Ссылка на оплату отправлена. После оплаты кормушка активируется автоматически.")
+
+    async def handle_buy_echosounder(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Покупка эхолота за Telegram Stars."""
+        query = update.callback_query
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+
+        if not query.data.endswith(f"_{user_id}"):
+            await query.answer("Эта кнопка не для вас", show_alert=True)
+            return
+
+        await query.answer()
+
+        remaining = db.get_echosounder_remaining_seconds(user_id, chat_id)
+        if remaining > 0:
+            await query.answer(
+                f"Эхолот уже активен: {self._format_seconds_compact(remaining)}",
+                show_alert=True,
+            )
+            return
+
+        tg_api = TelegramBotAPI(BOT_TOKEN)
+        payload = self._build_booster_payload(ECHOSOUNDER_CODE, user_id, chat_id)
+        invoice_url = await tg_api.create_invoice_link(
+            title="Эхолот",
+            description="Активация эхолота на 24 часа",
+            payload=payload,
+            currency="XTR",
+            prices=[{"label": "Эхолот 24ч", "amount": ECHOSOUNDER_COST_STARS}],
+        )
+
+        if not invoice_url:
+            await query.edit_message_text("❌ Не удалось создать ссылку оплаты. Попробуйте позже.")
+            return
+
+        await self.send_invoice_url_button(
+            chat_id=chat_id,
+            invoice_url=invoice_url,
+            text=f"⭐ Оплатите {ECHOSOUNDER_COST_STARS} Telegram Stars для активации эхолота на 24 часа.",
+            user_id=user_id,
+            timeout_sec=900,
+        )
+
+        await query.edit_message_text("Ссылка на оплату отправлена. После оплаты эхолот активируется автоматически.")
     
     async def handle_buy_net(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка покупки сети"""
@@ -2572,6 +3122,7 @@ class FishBot:
             [InlineKeyboardButton("🎣 Удочки", callback_data=f"shop_rods_{user_id}")],
             [InlineKeyboardButton("🪱 Наживки", callback_data=f"shop_baits_{user_id}")],
             [InlineKeyboardButton("�️ Сети", callback_data=f"shop_nets_{user_id}")],
+            [InlineKeyboardButton("🧺 Кормушки", callback_data=f"shop_feeders_{user_id}")],
             [InlineKeyboardButton("�🔙 Назад", callback_data=f"back_to_menu_{user_id}")]
         ]
         
@@ -2868,6 +3419,7 @@ class FishBot:
     async def handle_inventory_location(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показать рыбу с определенной локации в инвентаре"""
         query = update.callback_query
+        data = query.data or ""
         try:
             user_id = update.effective_user.id
             chat_id = update.effective_chat.id
@@ -2876,15 +3428,33 @@ class FishBot:
             return
         
         # Проверка прав доступа
-        if not query.data.endswith(f"_{user_id}"):
+        owner_id = None
+        if data.startswith("inv_location_") and "_page_" in data:
+            try:
+                before_page = data.split("_page_", 1)[0]
+                owner_id = int(before_page.rsplit("_", 1)[-1])
+            except Exception:
+                owner_id = None
+        else:
+            try:
+                owner_id = int(data.rsplit("_", 1)[-1])
+            except Exception:
+                owner_id = None
+
+        if owner_id != user_id:
             await query.answer("Эта кнопка не для вас", show_alert=True)
             return
         
         # Извлекаем локацию из callback_data
         # Формат: inv_location_{location}_{user_id}
-        parts = query.data.split('_')
-        # Локация может содержать подчеркивания, поэтому берем все до последнего user_id
-        location = '_'.join(parts[2:-1]).replace('_', ' ')
+        # Для пагинации формат: inv_location_{location}_{user_id}_page_{page}
+        if data.startswith("inv_location_") and "_page_" in data:
+            location_part = data[len("inv_location_"):].split("_page_", 1)[0]
+            location = '_'.join(location_part.split('_')[:-1]).replace('_', ' ')
+        else:
+            parts = data.split('_')
+            # Локация может содержать подчеркивания, поэтому берем все до последнего user_id
+            location = '_'.join(parts[2:-1]).replace('_', ' ')
         
         await query.answer()
         
@@ -2899,9 +3469,9 @@ class FishBot:
         # --- ПАГИНАЦИЯ ---
         page = 0
         # Формат callback_data: inv_location_{location}_{user_id}_page_{page}
-        if query.data.startswith("inv_location_") and "_page_" in query.data:
+        if data.startswith("inv_location_") and "_page_" in data:
             try:
-                page = int(query.data.split("_page_")[-1])
+                page = int(data.split("_page_")[-1])
             except Exception:
                 page = 0
         elif hasattr(context, 'user_data') and 'inv_page' in context.user_data:
@@ -3198,6 +3768,7 @@ class FishBot:
             return
         
         stats = db.get_player_stats(user_id, chat_id)
+        total_species = db.get_total_fish_species()
         caught_fish = db.get_caught_fish(user_id, chat_id)
         
         message = f"""
@@ -3207,7 +3778,7 @@ class FishBot:
 📏 Общий вес: {stats['total_weight']} кг
 🗑️ Мусорный вес: {stats.get('trash_weight', 0)} кг
 💰 Продано: {stats.get('sold_fish_count', 0)} рыб ({stats.get('sold_fish_weight', 0)} кг)
-🔢 Уникальных видов: {stats['unique_fish']}
+🔢 Уникальных видов: {stats['unique_fish']}/{total_species}
 🏆 Самая большая рыба: {stats['biggest_fish']} ({stats['biggest_weight']} кг)
 
 💰 Баланс: {player['coins']} 🪙
@@ -3814,6 +4385,7 @@ class FishBot:
             return
         
         stats = db.get_player_stats(user_id, chat_id)
+        total_species = db.get_total_fish_species()
         caught_fish = db.get_caught_fish(user_id, chat_id)
         
         message = f"""
@@ -3822,7 +4394,7 @@ class FishBot:
 🎣 Всего поймано рыбы: {stats['total_fish']}
 📏 Общий вес: {stats['total_weight']} кг
 💰 Продано: {stats.get('sold_fish_count', 0)} рыб ({stats.get('sold_fish_weight', 0)} кг)
-🔢 Уникальных видов: {stats['unique_fish']}
+🔢 Уникальных видов: {stats['unique_fish']}/{total_species}
 🏆 Самая большая рыба: {stats['biggest_fish']} ({stats['biggest_weight']} кг)
 
 💰 Баланс: {player['coins']} 🪙
@@ -4121,8 +4693,8 @@ class FishBot:
         """Обработка precheckout для Telegram Stars"""
         query = update.pre_checkout_query
         payload = getattr(query, "invoice_payload", "") or ""
+        user_id = query.from_user.id
         if payload.startswith("guaranteed_"):
-            user_id = query.from_user.id
             parsed = self._parse_guaranteed_payload(payload)
             if not parsed:
                 await query.answer(ok=False, error_message="Инвойс устарел. Запросите новый.")
@@ -4138,6 +4710,48 @@ class FishBot:
             if isinstance(created_ts, int) and now_ts - created_ts > 900:
                 await query.answer(ok=False, error_message="Срок действия инвойса истек. Запросите новый.")
                 return
+        elif payload.startswith("harpoon_skip_"):
+            parsed_harpoon = self._parse_harpoon_skip_payload(payload)
+            if not parsed_harpoon:
+                await query.answer(ok=False, error_message="Инвойс гарпуна устарел. Запросите новый.")
+                return
+
+            if parsed_harpoon.get("payload_user_id") != user_id:
+                await query.answer(ok=False, error_message="Этот инвойс создан для другого пользователя.")
+                return
+
+            created_ts = parsed_harpoon.get("created_ts")
+            now_ts = int(datetime.now().timestamp())
+            if isinstance(created_ts, int) and now_ts - created_ts > 900:
+                await query.answer(ok=False, error_message="Срок действия инвойса истек. Запросите новый.")
+                return
+        elif payload.startswith("booster_"):
+            parsed_booster = self._parse_booster_payload(payload)
+            if not parsed_booster:
+                await query.answer(ok=False, error_message="Инвойс бустера устарел. Запросите новый.")
+                return
+
+            if parsed_booster.get("payload_user_id") != user_id:
+                await query.answer(ok=False, error_message="Этот инвойс создан для другого пользователя.")
+                return
+
+            created_ts = parsed_booster.get("created_ts")
+            now_ts = int(datetime.now().timestamp())
+            if isinstance(created_ts, int) and now_ts - created_ts > 900:
+                await query.answer(ok=False, error_message="Срок действия инвойса истек. Запросите новый.")
+                return
+
+            booster_code = str(parsed_booster.get("booster_code") or "")
+            payload_chat_id = int(parsed_booster.get("group_chat_id") or 0)
+            if booster_code == ECHOSOUNDER_CODE:
+                if db.is_echosounder_active(user_id, payload_chat_id):
+                    await query.answer(ok=False, error_message="Эхолот уже активен. Дождитесь окончания.")
+                    return
+            else:
+                active_feeder = db.get_active_feeder(user_id, payload_chat_id)
+                if active_feeder:
+                    await query.answer(ok=False, error_message="Кормушка уже активна. Дождитесь окончания.")
+                    return
         await query.answer(ok=True)
     
     async def successful_payment_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4150,10 +4764,20 @@ class FishBot:
 
         accounting_chat_id = chat_id
         parsed_guaranteed_payload = None
+        parsed_harpoon_payload = None
+        parsed_booster_payload = None
         if payload.startswith("guaranteed_"):
             parsed_guaranteed_payload = self._parse_guaranteed_payload(payload)
             if parsed_guaranteed_payload and parsed_guaranteed_payload.get("group_chat_id"):
                 accounting_chat_id = int(parsed_guaranteed_payload["group_chat_id"])
+        elif payload.startswith("harpoon_skip_"):
+            parsed_harpoon_payload = self._parse_harpoon_skip_payload(payload)
+            if parsed_harpoon_payload and parsed_harpoon_payload.get("group_chat_id"):
+                accounting_chat_id = int(parsed_harpoon_payload["group_chat_id"])
+        elif payload.startswith("booster_"):
+            parsed_booster_payload = self._parse_booster_payload(payload)
+            if parsed_booster_payload and parsed_booster_payload.get("group_chat_id"):
+                accounting_chat_id = int(parsed_booster_payload["group_chat_id"])
         elif active_invoice.get("group_chat_id"):
             try:
                 accounting_chat_id = int(active_invoice.get("group_chat_id"))
@@ -4219,6 +4843,74 @@ class FishBot:
                 )
             except Exception as e:
                 logger.warning(f"Could not send repair confirmation to {user_id}: {e}")
+            return
+        elif payload and payload.startswith("harpoon_skip_"):
+            if not parsed_harpoon_payload:
+                parsed_harpoon_payload = self._parse_harpoon_skip_payload(payload)
+
+            group_chat_id = accounting_chat_id
+            if parsed_harpoon_payload and parsed_harpoon_payload.get("group_chat_id"):
+                group_chat_id = int(parsed_harpoon_payload["group_chat_id"])
+
+            group_message_id = None
+            if user_id in self.active_invoices:
+                group_message_id = self.active_invoices[user_id].get('group_message_id')
+                del self.active_invoices[user_id]
+
+            await self._execute_harpoon_catch(
+                user_id=user_id,
+                group_chat_id=group_chat_id,
+                reply_to_message_id=group_message_id,
+            )
+            return
+        elif payload and payload.startswith("booster_"):
+            if not parsed_booster_payload:
+                parsed_booster_payload = self._parse_booster_payload(payload)
+
+            if not parsed_booster_payload:
+                await update.message.reply_text("❌ Не удалось обработать оплату бустера. Попробуйте ещё раз.")
+                return
+
+            booster_code = str(parsed_booster_payload.get("booster_code") or "")
+            group_chat_id = int(parsed_booster_payload.get("group_chat_id") or accounting_chat_id)
+
+            if user_id in self.active_invoices:
+                del self.active_invoices[user_id]
+
+            if booster_code == ECHOSOUNDER_CODE:
+                db.activate_echosounder(user_id, group_chat_id, ECHOSOUNDER_DURATION_HOURS)
+                await self._safe_send_message(
+                    chat_id=group_chat_id,
+                    text=(
+                        f"✅ Эхолот активирован на {ECHOSOUNDER_DURATION_HOURS} часа!\n"
+                        "Откройте меню наживки и нажмите кнопку 'Эхолот'."
+                    ),
+                )
+                if group_chat_id != chat_id:
+                    await update.message.reply_text("✅ Эхолот активирован в игровом чате.")
+                return
+
+            feeder = self._get_feeder_by_code(booster_code)
+            if not feeder:
+                await update.message.reply_text("❌ Неизвестный тип кормушки.")
+                return
+
+            db.activate_feeder(
+                user_id,
+                group_chat_id,
+                feeder_type=booster_code,
+                bonus_percent=int(feeder["bonus"]),
+                duration_minutes=int(feeder["duration_minutes"]),
+            )
+            await self._safe_send_message(
+                chat_id=group_chat_id,
+                text=(
+                    f"✅ {feeder['name']} активирована на 1 час!\n"
+                    f"🎯 Бонус к клёву: +{feeder['bonus']}%"
+                ),
+            )
+            if group_chat_id != chat_id:
+                await update.message.reply_text("✅ Кормушка активирована в игровом чате.")
             return
         elif payload and payload.startswith("guaranteed_"):
             parsed = parsed_guaranteed_payload or self._parse_guaranteed_payload(payload)
@@ -5128,6 +5820,8 @@ def main():
     application.add_handler(CommandHandler("grant_net", grant_net_command))
     application.add_handler(CommandHandler("grant_rod", grant_rod_command))
     application.add_handler(CommandHandler("chatstar", chatstar_command))
+    application.add_handler(CommandHandler("ref", bot_instance.ref_command))
+    application.add_handler(CommandHandler("new_ref", bot_instance.new_ref_command))
     application.add_handler(CommandHandler("new_tour", bot_instance.new_tour_command))
     # debug handlers removed
     application.add_handler(CommandHandler("fish", bot_instance.fish_command))
@@ -5153,6 +5847,10 @@ def main():
     # Обработчик новых участников группы отключён — не присылаем автоматические приветствия
     # (application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, bot_instance.welcome_new_member)))
     
+    # Ввод для сценариев /ref и /new_ref
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot_instance.handle_withdraw_stars_input))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot_instance.handle_new_ref_input))
+
     # Обработчик сообщений о рыбалке и покупке наживки (должен быть перед filters.ALL)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot_instance.handle_fish_message))
     
@@ -5179,6 +5877,8 @@ def main():
     application.add_handler(CallbackQueryHandler(bot_instance.handle_select_bait, pattern="^sbi_"))
     application.add_handler(CallbackQueryHandler(bot_instance.handle_select_net, pattern="^select_net_"))  # Выбор сети в меню
     application.add_handler(CallbackQueryHandler(bot_instance.handle_pay_invoice_callback, pattern="^pay_invoice:"))
+    application.add_handler(CallbackQueryHandler(bot_instance.handle_use_harpoon_paid, pattern="^use_harpoon_paid_"))
+    application.add_handler(CallbackQueryHandler(bot_instance.handle_use_harpoon, pattern="^use_harpoon_"))
     application.add_handler(CallbackQueryHandler(bot_instance.handle_use_net, pattern="^use_net_"))  # Использование сетей
     application.add_handler(CallbackQueryHandler(bot_instance.handle_back_to_menu, pattern="^back_to_menu_"))
     application.add_handler(CallbackQueryHandler(bot_instance.handle_sell_fish, pattern=r"^sell_fish_\d+$"))
@@ -5195,8 +5895,13 @@ def main():
     application.add_handler(CallbackQueryHandler(bot_instance.handle_shop_baits_location, pattern="^shop_baits_loc_"))
     application.add_handler(CallbackQueryHandler(bot_instance.handle_shop_baits, pattern="^shop_baits_"))
     application.add_handler(CallbackQueryHandler(bot_instance.handle_shop_nets, pattern="^shop_nets_"))
+    application.add_handler(CallbackQueryHandler(bot_instance.handle_shop_feeders, pattern="^shop_feeders_"))
     application.add_handler(CallbackQueryHandler(bot_instance.handle_buy_rod, pattern="^buy_rod_"))
     application.add_handler(CallbackQueryHandler(bot_instance.handle_buy_net, pattern="^buy_net_"))
+    application.add_handler(CallbackQueryHandler(bot_instance.handle_buy_feeder_coins, pattern="^buy_feeder_coins_"))
+    application.add_handler(CallbackQueryHandler(bot_instance.handle_buy_feeder_stars, pattern="^buy_feeder_stars_"))
+    application.add_handler(CallbackQueryHandler(bot_instance.handle_buy_echosounder, pattern="^buy_echosounder_"))
+    application.add_handler(CallbackQueryHandler(bot_instance.handle_show_echosounder, pattern="^show_echosounder_"))
     application.add_handler(CallbackQueryHandler(bot_instance.handle_repair_callback, pattern="^repair_"))
     application.add_handler(CallbackQueryHandler(bot_instance.handle_stats_callback, pattern="^stats_"))
     application.add_handler(CallbackQueryHandler(bot_instance.handle_leaderboard_callback, pattern="^leaderboard$"))
@@ -5205,6 +5910,7 @@ def main():
     application.add_handler(CallbackQueryHandler(bot_instance.handle_invoice_cancelled_callback, pattern="^invoice_cancelled$"))
     application.add_handler(CallbackQueryHandler(bot_instance.handle_pay_telegram_star_callback, pattern="^pay_telegram_star_"))
     application.add_handler(CallbackQueryHandler(bot_instance.handle_invoice_sent_callback, pattern="^invoice_sent$"))
+    application.add_handler(CallbackQueryHandler(bot_instance.handle_approve_withdraw_callback, pattern="^approve_withdraw_"))
     
     # Обработчик ошибок
     application.add_error_handler(bot_instance.error_handler)

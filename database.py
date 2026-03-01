@@ -3,7 +3,7 @@ import sqlite3
 import logging
 import random
 from typing import Any, Dict, List, Optional, Union
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -921,6 +921,11 @@ class Database:
             ensure_column('star_transactions', 'chat_title', 'TEXT')
             ensure_column('player_rods', 'chat_id', 'INTEGER')
             ensure_column('player_nets', 'chat_id', 'INTEGER')
+            ensure_column('players', 'last_harpoon_use_time', 'TEXT')
+            ensure_column('players', 'active_feeder_type', 'TEXT')
+            ensure_column('players', 'active_feeder_bonus', 'INTEGER DEFAULT 0')
+            ensure_column('players', 'feeder_expires_at', 'TEXT')
+            ensure_column('players', 'echosounder_expires_at', 'TEXT')
             ensure_column('chat_configs', 'admin_ref_link', 'TEXT')
             ensure_column('chat_configs', 'chat_invite_link', 'TEXT')
             ensure_column('user_ref_links', 'chat_invite_link', 'TEXT')
@@ -1683,7 +1688,9 @@ class Database:
         # Allow only specific fields to be updated to avoid SQL injection
         allowed_fields = {
             'username', 'coins', 'stars', 'xp', 'level', 'current_rod', 'current_bait',
-            'current_location', 'last_fish_time', 'is_banned', 'ban_until', 'ref', 'ref_link', 'last_net_use_time'
+            'current_location', 'last_fish_time', 'is_banned', 'ban_until', 'ref', 'ref_link',
+            'last_net_use_time', 'last_harpoon_use_time',
+            'active_feeder_type', 'active_feeder_bonus', 'feeder_expires_at', 'echosounder_expires_at'
         }
 
         # Prevent passing chat_id as a kwarg (it is a positional arg here)
@@ -1912,6 +1919,14 @@ class Database:
                 'sold_fish_count': sold_count or 0,
                 'sold_fish_weight': sold_weight or 0
             }
+
+    def get_total_fish_species(self) -> int:
+        """Получить общее число видов рыб в игре."""
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT COUNT(*) FROM fish')
+            row = cursor.fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
     
     def get_rod(self, rod_name: str) -> Optional[Dict[str, Any]]:
         """Получить информацию об удочке"""
@@ -2020,6 +2035,167 @@ class Database:
             
             conn.commit()
             return True
+
+    def get_harpoon_cooldown_remaining(self, user_id: int, chat_id: int, cooldown_minutes: int = 20) -> int:
+        """Оставшееся время КД гарпуна в секундах."""
+        player = self.get_player(user_id, chat_id)
+        if not player:
+            return 0
+
+        last_use = player.get('last_harpoon_use_time')
+        if not last_use:
+            return 0
+
+        try:
+            last_time = datetime.fromisoformat(last_use)
+        except Exception:
+            return 0
+
+        passed = datetime.now() - last_time
+        cooldown_delta = timedelta(minutes=cooldown_minutes)
+        if passed >= cooldown_delta:
+            return 0
+
+        remaining = int((cooldown_delta - passed).total_seconds())
+        return max(0, remaining)
+
+    def mark_harpoon_used(self, user_id: int, chat_id: int) -> bool:
+        """Пометить время последнего использования гарпуна."""
+        try:
+            self.update_player(user_id, chat_id, last_harpoon_use_time=datetime.now().isoformat())
+            return True
+        except Exception as e:
+            logger.error("mark_harpoon_used error: %s", e)
+            return False
+
+    def activate_feeder(self, user_id: int, chat_id: int, feeder_type: str, bonus_percent: int, duration_minutes: int = 60) -> bool:
+        """Активировать кормушку на заданное время."""
+        try:
+            expires_at = (datetime.now() + timedelta(minutes=duration_minutes)).isoformat()
+            self.update_player(
+                user_id,
+                chat_id,
+                active_feeder_type=feeder_type,
+                active_feeder_bonus=int(bonus_percent),
+                feeder_expires_at=expires_at,
+            )
+            return True
+        except Exception as e:
+            logger.error("activate_feeder error: %s", e)
+            return False
+
+    def get_active_feeder(self, user_id: int, chat_id: int) -> Optional[Dict[str, Any]]:
+        """Получить активную кормушку (если есть и не истекла)."""
+        player = self.get_player(user_id, chat_id)
+        if not player:
+            return None
+
+        feeder_type = player.get('active_feeder_type')
+        feeder_bonus = int(player.get('active_feeder_bonus') or 0)
+        expires_raw = player.get('feeder_expires_at')
+
+        if not feeder_type or not expires_raw or feeder_bonus <= 0:
+            return None
+
+        try:
+            expires_at = datetime.fromisoformat(str(expires_raw))
+        except Exception:
+            self.update_player(
+                user_id,
+                chat_id,
+                active_feeder_type=None,
+                active_feeder_bonus=0,
+                feeder_expires_at=None,
+            )
+            return None
+
+        now = datetime.now()
+        if expires_at <= now:
+            self.update_player(
+                user_id,
+                chat_id,
+                active_feeder_type=None,
+                active_feeder_bonus=0,
+                feeder_expires_at=None,
+            )
+            return None
+
+        remaining = int((expires_at - now).total_seconds())
+        return {
+            'type': feeder_type,
+            'bonus_percent': feeder_bonus,
+            'expires_at': expires_at.isoformat(),
+            'remaining_seconds': max(0, remaining),
+        }
+
+    def get_active_feeder_bonus(self, user_id: int, chat_id: int) -> int:
+        """Получить бонус активной кормушки в процентах."""
+        feeder = self.get_active_feeder(user_id, chat_id)
+        if not feeder:
+            return 0
+        return int(feeder.get('bonus_percent') or 0)
+
+    def get_feeder_cooldown_remaining(self, user_id: int, chat_id: int) -> int:
+        """Оставшееся время действия активной кормушки в секундах."""
+        feeder = self.get_active_feeder(user_id, chat_id)
+        if not feeder:
+            return 0
+        return int(feeder.get('remaining_seconds') or 0)
+
+    def activate_echosounder(self, user_id: int, chat_id: int, duration_hours: int = 24) -> bool:
+        """Активировать эхолот на заданное количество часов."""
+        try:
+            expires_at = (datetime.now() + timedelta(hours=duration_hours)).isoformat()
+            self.update_player(user_id, chat_id, echosounder_expires_at=expires_at)
+            return True
+        except Exception as e:
+            logger.error("activate_echosounder error: %s", e)
+            return False
+
+    def is_echosounder_active(self, user_id: int, chat_id: int) -> bool:
+        """Проверить, активен ли эхолот."""
+        player = self.get_player(user_id, chat_id)
+        if not player:
+            return False
+
+        expires_raw = player.get('echosounder_expires_at')
+        if not expires_raw:
+            return False
+
+        try:
+            expires_at = datetime.fromisoformat(str(expires_raw))
+        except Exception:
+            self.update_player(user_id, chat_id, echosounder_expires_at=None)
+            return False
+
+        if expires_at <= datetime.now():
+            self.update_player(user_id, chat_id, echosounder_expires_at=None)
+            return False
+
+        return True
+
+    def get_echosounder_remaining_seconds(self, user_id: int, chat_id: int) -> int:
+        """Оставшееся время действия эхолота в секундах."""
+        player = self.get_player(user_id, chat_id)
+        if not player:
+            return 0
+
+        expires_raw = player.get('echosounder_expires_at')
+        if not expires_raw:
+            return 0
+
+        try:
+            expires_at = datetime.fromisoformat(str(expires_raw))
+        except Exception:
+            self.update_player(user_id, chat_id, echosounder_expires_at=None)
+            return 0
+
+        now = datetime.now()
+        if expires_at <= now:
+            self.update_player(user_id, chat_id, echosounder_expires_at=None)
+            return 0
+
+        return max(0, int((expires_at - now).total_seconds()))
     
     def get_caught_fish(self, user_id: int, chat_id: int) -> List[Dict[str, Any]]:
         """Получить всю пойманную рыбу пользователя"""

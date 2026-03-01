@@ -91,6 +91,11 @@ class FishingGame:
         player: Dict[str, Any] = db.get_player(user_id, chat_id)
         if not player:
             return False, "Сначала создайте профиль командой /start"
+
+        if player.get('current_rod') == 'Гарпун':
+            db.init_player_rod(user_id, BAMBOO_ROD, chat_id)
+            db.update_player(user_id, chat_id, current_rod=BAMBOO_ROD)
+            player = db.get_player(user_id, chat_id) or player
         
         # Проверка прочности удочки - если 0, нельзя ловить вообще
         player_rod = db.get_player_rod(user_id, player['current_rod'], chat_id)
@@ -123,6 +128,52 @@ class FishingGame:
         hours = int(remaining.total_seconds() // 3600)
         minutes = int((remaining.total_seconds() % 3600) // 60)
         return f"{hours}ч {minutes}мин"
+
+    def fish_with_harpoon(self, user_id: int, chat_id: int, location: str) -> Dict[str, Any]:
+        """Отдельная механика гарпуна (не удочка, отдельный инструмент)."""
+        player = db.get_player(user_id, chat_id)
+        if not player:
+            return {
+                "success": False,
+                "message": "Профиль не найден. Используйте /start в этом чате.",
+                "location": location,
+            }
+
+        player_level = player.get('level', 0) or 0
+        self.current_season = self._get_current_season()
+
+        fish_list = db.get_fish_by_location(location, self.current_season, min_level=player_level)
+        fish_list = self._normalize_fish_list(fish_list)
+        fish_list = [f for f in fish_list if float(f.get('min_weight', 0) or 0) >= 150]
+
+        if not fish_list:
+            return {
+                "success": False,
+                "message": "🐟 В этой локации нет рыбы для гарпуна (нужна рыба от 150 кг).",
+                "location": location,
+            }
+
+        caught_fish = random.choice(fish_list)
+        weight = round(random.uniform(float(caught_fish['min_weight']), float(caught_fish['max_weight'])), 2)
+        length = round(random.uniform(float(caught_fish['min_length']), float(caught_fish['max_length'])), 1)
+
+        if weight < 150:
+            return {
+                "success": False,
+                "message": "Гарпун разорвал рыбу на две части 😢",
+                "location": location,
+            }
+
+        db.add_caught_fish(user_id, chat_id, caught_fish['name'], weight, location, length)
+
+        return {
+            "success": True,
+            "fish": caught_fish,
+            "weight": weight,
+            "length": length,
+            "location": location,
+            "harpoon": True,
+        }
     
     def fish(self, user_id: int, chat_id: int, location: str = "Городской пруд", guaranteed: bool = False) -> Dict[str, Any]:
         """Основная функция ловли рыбы"""
@@ -156,6 +207,10 @@ class FishingGame:
                 "message": "Профиль не найден. Используйте /start в этом чате.",
                 "location": location
             }
+        if player.get('current_rod') == 'Гарпун':
+            db.init_player_rod(user_id, BAMBOO_ROD, chat_id)
+            db.update_player(user_id, chat_id, current_rod=BAMBOO_ROD)
+            player = db.get_player(user_id, chat_id) or player
         player_level = player.get('level', 0) or 0
         rod = db.get_rod(player['current_rod'])
 
@@ -169,10 +224,11 @@ class FishingGame:
 
         # Обновляем сезон
         self.current_season = self._get_current_season()
+        feeder_bonus = db.get_active_feeder_bonus(user_id, chat_id)
 
         # Если гарантированный улов
         if guaranteed:
-            return self._guaranteed_catch(user_id, location, player, chat_id)
+            return self._guaranteed_catch(user_id, location, player, chat_id, feeder_bonus)
 
         # Получаем погоду и применяем бонус
         weather = db.get_or_update_weather(location)
@@ -193,8 +249,8 @@ class FishingGame:
         # 10000 = NFT
         roll = random.randint(0, 10000)
 
-        # Применяем погодный бонус/штраф (уменьшенное влияние)
-        adjusted_roll = roll + (weather_bonus * 50)
+        # Применяем погодный бонус/штраф и бонус кормушки
+        adjusted_roll = roll + (weather_bonus * 50) + (feeder_bonus * 250)
         adjusted_roll = max(0, min(10000, adjusted_roll))  # Ограничиваем от 0 до 10000
 
         # --- ГАРПУН: спец.логика ---
@@ -215,7 +271,10 @@ class FishingGame:
             # (реализация ниже в коде catch)
         
         logger.info(f"🎣 User {user_id} started fishing at location: {location}")
-        logger.info(f"   🎲 Random roll: {roll}/10000 (adjusted: {adjusted_roll}/10000 with weather {weather_condition})")
+        logger.info(
+            f"   🎲 Random roll: {roll}/10000 (adjusted: {adjusted_roll}/10000 "
+            f"with weather {weather_condition}, feeder {feeder_bonus:+d}%)"
+        )
         logger.info("   📊 Ranges: 0-3000=NO_BITE, 3001-6000=TRASH, 6001-8500=COMMON, 8501-9700=RARE, 9701-9999=LEGENDARY, 10000=NFT")
         
         if roll == 10000:
@@ -492,12 +551,13 @@ class FishingGame:
             "temp_rod_broken": temp_rod_result.get("broken", False)
         }
     
-    def _guaranteed_catch(self, user_id: int, location: str, player: Dict[str, Any], chat_id: int) -> Dict[str, Any]:
+    def _guaranteed_catch(self, user_id: int, location: str, player: Dict[str, Any], chat_id: int, feeder_bonus: int = 0) -> Dict[str, Any]:
         """Гарантированный улов с фиксированными шансами."""
         roll = random.randint(0, 1000)
-        logger.info(f"   🎲 Guaranteed roll: {roll}/1000")
+        adjusted_roll = max(0, min(1000, roll + (feeder_bonus * 25)))
+        logger.info(f"   🎲 Guaranteed roll: {roll}/1000 (adjusted: {adjusted_roll}/1000, feeder {feeder_bonus:+d}%)")
 
-        if roll <= 400:
+        if adjusted_roll <= 400:
             # Trash branch for guaranteed cast
             logger.info("   📊 Result: TRASH (roll in range 0-400)")
             trash = db.get_random_trash(location)
@@ -540,14 +600,14 @@ class FishingGame:
                     "temp_rod_broken": temp_rod_result.get("broken", False)
                 }
 
-        elif roll <= 700:
+        elif adjusted_roll <= 700:
             target_rarity = "Обычная"
-        elif roll <= 980:
+        elif adjusted_roll <= 980:
             target_rarity = "Редкая"
         else:
             target_rarity = "Легендарная"
 
-        logger.info(f"   🎯 Rarity: {target_rarity} (roll: {roll})")
+        logger.info(f"   🎯 Rarity: {target_rarity} (roll: {adjusted_roll})")
 
         # Гарантированный улов: учитывать только сезон, игнорировать наживку.
         fish_list = db.get_fish_by_location(location, self.current_season, min_level=player.get('level', 0))
