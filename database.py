@@ -94,6 +94,7 @@ class PostgresConnWrapper:
                                 vals = s[start_vals+1:end_vals]
                                 # mapping of tables -> conflict target
                                 conflict_map = {
+                                    'rods': 'name',
                                     'baits': 'name',
                                     'fish': 'name',
                                     'player_baits': 'user_id, bait_name',
