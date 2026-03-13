@@ -1,9 +1,8 @@
 import os
-import sqlite3
 import logging
 import random
 from typing import Any, Dict, List, Optional, Union
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -33,6 +32,9 @@ class PostgresConnWrapper:
         s = re.sub(r"INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT", 'SERIAL PRIMARY KEY', s, flags=re.IGNORECASE)
         # Also handle bare AUTOINCREMENT token
         s = re.sub(r"AUTOINCREMENT", '', s, flags=re.IGNORECASE)
+        # Convert empty double-quoted string literals ("") to PostgreSQL single-quoted ('').
+        # SQLite allows "" as an empty string; Postgres treats "" as an invalid zero-length identifier.
+        s = s.replace('""', "''")
         # Convert sqlite '?' placeholders to psycopg2 '%s'
         s = s.replace('?', '%s')
         # Replace sqlite datetime(...) with inner expression (Postgres uses native timestamp types)
@@ -94,7 +96,6 @@ class PostgresConnWrapper:
                                 vals = s[start_vals+1:end_vals]
                                 # mapping of tables -> conflict target
                                 conflict_map = {
-                                    'rods': 'name',
                                     'baits': 'name',
                                     'fish': 'name',
                                     'player_baits': 'user_id, bait_name',
@@ -159,12 +160,14 @@ class PostgresConnWrapper:
                 if isinstance(params, list):
                     params = tuple(params)
                 try:
+                    logger.debug("Postgres executing SQL: %s PARAMS: %s", out_sql, params)
                     cur.execute(out_sql, params)
                 except Exception:
                     logger.exception("DB execute failed. SQL: %s PARAMS: %s", out_sql, params)
                     raise
             else:
                 try:
+                    logger.debug("Postgres executing SQL: %s (no params)", out_sql)
                     cur.execute(out_sql)
                 except Exception:
                     logger.exception("DB execute failed. SQL: %s", out_sql)
@@ -301,9 +304,6 @@ def ensure_serial_pk(conn, table: str, id_col: str = 'id'):
     """Ensure the integer primary key column has a Postgres sequence DEFAULT.
     Safe to call multiple times; will create sequence if missing and set it to max(id).
     """
-    # Для SQLite ничего не делаем
-    if hasattr(conn, 'execute'):
-        return
     try:
         cur = conn.cursor()
         cur.execute(
@@ -346,11 +346,7 @@ def ensure_all_serial_pks(conn):
     Finds PK columns of integer types without a nextval() default and installs
     a sequence + DEFAULT for them. Safe to call multiple times.
     """
-    # Для SQLite ничего не делаем, для Postgres оставляем как есть
     try:
-        if hasattr(conn, 'execute'):
-            # SQLite: пропускаем
-            return
         cur = conn.cursor()
         cur.execute(
             """
@@ -391,7 +387,7 @@ TEMP_ROD_RANGES = {
     "Углепластиковая удочка": (30, 70),
     "Карбоновая удочка": (50, 100),
     "Золотая удочка": (90, 150),
-    "Удачливая удочка": (150, 200),
+    "Удачливая удочка": (140, 160),
 }
 
 LEVEL_XP_REQUIREMENTS = [
@@ -417,26 +413,41 @@ BASE_XP_BY_RARITY = {
     "Обычная": 5,
     "Редкая": 20,
     "Легендарная": 100,
-    "Мифическая": 180,
+    "Мифическая": 50,
 }
 
 RARITY_XP_MULTIPLIERS = {
     "Обычная": 1.0,
     "Редкая": 1.1,
     "Легендарная": 1.2,
-    "Мифическая": 1.35,
+    "Мифическая": 1.15,
 }
 
 class Database:
     def __init__(self):
+        self._cached_conn: Optional['PostgresConnWrapper'] = None
         self.init_db()
 
     def _connect(self):
+        # Postgres-only: require DATABASE_URL in environment
         db_url = os.getenv('DATABASE_URL')
-        if db_url:
-            return PostgresConnWrapper(db_url)
-        # Fallback to SQLite for testing/dev
-        return sqlite3.connect(str(DB_PATH))
+        if not db_url:
+            raise RuntimeError('DATABASE_URL must be set to use Postgres')
+        # Reuse the cached connection instead of creating a new one on every call
+        if self._cached_conn is not None:
+            try:
+                cur = self._cached_conn._conn.cursor()
+                cur.execute('SELECT 1')
+                cur.close()
+                return self._cached_conn
+            except Exception:
+                try:
+                    self._cached_conn._conn.close()
+                except Exception:
+                    pass
+                self._cached_conn = None
+        self._cached_conn = PostgresConnWrapper(db_url)
+        return self._cached_conn
 
     def _get_temp_rod_uses(self, rod_name: str) -> Optional[int]:
         rod_range = TEMP_ROD_RANGES.get(rod_name)
@@ -456,6 +467,7 @@ class Database:
                     username TEXT NOT NULL,
                     coins INTEGER DEFAULT 100,
                     stars INTEGER DEFAULT 0,
+                    diamonds INTEGER DEFAULT 0,
                     xp INTEGER DEFAULT 0,
                     level INTEGER DEFAULT 0,
                     current_rod TEXT DEFAULT 'Бамбуковая удочка',
@@ -569,6 +581,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS caught_fish (
                     id INTEGER PRIMARY KEY,
                     user_id INTEGER NOT NULL,
+                    chat_id BIGINT,
                     fish_name TEXT NOT NULL,
                     weight REAL NOT NULL,
                     length REAL DEFAULT 0,
@@ -579,6 +592,14 @@ class Database:
                     FOREIGN KEY (user_id) REFERENCES players (user_id)
                 )
             ''')
+            # Ensure `chat_id` column exists (some deployments may have been created without it)
+            try:
+                cursor.execute("ALTER TABLE caught_fish ADD COLUMN IF NOT EXISTS chat_id BIGINT")
+            except Exception:
+                try:
+                    cursor.execute("ALTER TABLE caught_fish ADD COLUMN chat_id BIGINT")
+                except Exception:
+                    pass
 
             # Таблица транзакций Telegram Stars
             cursor.execute('''
@@ -658,20 +679,6 @@ class Database:
                 )
             ''')
 
-            # Таблица реферальной статистики звёзд (агрегаты по user_id + chat_id)
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS ref_stars_stats (
-                    user_id BIGINT NOT NULL,
-                    chat_id BIGINT NOT NULL,
-                    stars_received INTEGER DEFAULT 0,
-                    stars_spent INTEGER DEFAULT 0,
-                    stars_refunded INTEGER DEFAULT 0,
-                    stars_withdrawn INTEGER DEFAULT 0,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (user_id, chat_id)
-                )
-            ''')
-
             # Таблица системных флагов/миграций
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS system_flags (
@@ -680,19 +687,16 @@ class Database:
                 )
             ''')
 
-            # Таблица турниров (конкурсов)
+            # Таблица сокровищ игроков
             cursor.execute('''
-                CREATE TABLE IF NOT EXISTS tournaments (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    chat_id BIGINT NOT NULL,
-                    created_by BIGINT NOT NULL,
-                    title TEXT NOT NULL,
-                    tournament_type TEXT NOT NULL,
-                    target_fish TEXT,
-                    starts_at TIMESTAMP NOT NULL,
-                    ends_at TIMESTAMP NOT NULL,
-                    status TEXT DEFAULT 'scheduled',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                CREATE TABLE IF NOT EXISTS player_treasures (
+                    id INTEGER PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    chat_id BIGINT DEFAULT -1,
+                    treasure_name TEXT NOT NULL,
+                    quantity INTEGER DEFAULT 1,
+                    obtained_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id, chat_id, treasure_name)
                 )
             ''')
             
@@ -710,12 +714,9 @@ class Database:
 
         # Миграции - добавляем колонки если их нет
         self._run_migrations()
-
-        # Заполняем начальными данными (можно отключить для smoke-check БД)
-        if os.getenv('FISHBOT_SKIP_DEFAULT_FILL') == '1':
-            logger.info('Skipping _fill_default_data due to FISHBOT_SKIP_DEFAULT_FILL=1')
-        else:
-            self._fill_default_data()
+        
+        # Заполняем начальными данными
+        self._fill_default_data()
     
     def _run_migrations(self):
         """Выполнение миграций для обновления схемы БД"""
@@ -723,93 +724,63 @@ class Database:
             cursor = conn.cursor()
 
             def get_columns(table_name: str):
-                # SQLite: используем PRAGMA table_info
-                if type(cursor).__module__.startswith('sqlite3'):
-                    cursor.execute(f"PRAGMA table_info({table_name})")
-                    return [r[1] for r in cursor.fetchall()]
-                else:
-                    # Postgres: используем information_schema
-                    cursor.execute(
-                        "SELECT column_name FROM information_schema.columns WHERE table_name = %s AND table_schema = 'public'",
-                        (table_name,)
-                    )
-                    return [r[0] for r in cursor.fetchall()]
+                cursor.execute(
+                    "SELECT column_name FROM information_schema.columns WHERE table_name = %s AND table_schema = 'public'",
+                    (table_name,)
+                )
+                return [r[0] for r in cursor.fetchall()]
 
             # Проверяем наличие колонок в таблице players (Postgres-friendly)
             columns = get_columns('players')
 
-            # Добавление колонок для SQLite и Postgres
-            def add_column_if_missing(table, col, coltype):
-                cols = get_columns(table)
-                if col not in cols:
-                    try:
-                        cursor.execute(f'ALTER TABLE {table} ADD COLUMN {col} {coltype}')
-                        conn.commit()
-                    except Exception:
-                        pass
+            if 'ref' not in columns:
+                cursor.execute('ALTER TABLE players ADD COLUMN ref INTEGER')
+                conn.commit()
 
-            add_column_if_missing('players', 'ref', 'INTEGER')
-            add_column_if_missing('players', 'ref_link', 'TEXT')
-            add_column_if_missing('players', 'chat_id', 'BIGINT')
-            add_column_if_missing('players', 'xp', 'INTEGER DEFAULT 0')
-            add_column_if_missing('players', 'level', 'INTEGER DEFAULT 0')
-            add_column_if_missing('players', 'last_net_use_time', 'TEXT')
-            add_column_if_missing('chat_configs', 'stars_total', 'INTEGER DEFAULT 0')
-            add_column_if_missing('chat_configs', 'chat_title', 'TEXT')
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS tournaments (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    chat_id BIGINT NOT NULL,
-                    created_by BIGINT NOT NULL,
-                    title TEXT NOT NULL,
-                    tournament_type TEXT NOT NULL,
-                    target_fish TEXT,
-                    starts_at TIMESTAMP NOT NULL,
-                    ends_at TIMESTAMP NOT NULL,
-                    status TEXT DEFAULT 'scheduled',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            add_column_if_missing('tournaments', 'target_fish', 'TEXT')
-            add_column_if_missing('tournaments', 'status', "TEXT DEFAULT 'scheduled'")
-            add_column_if_missing('tournaments', 'created_at', 'TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
+            if 'ref_link' not in columns:
+                cursor.execute('ALTER TABLE players ADD COLUMN ref_link TEXT')
+                conn.commit()
 
-            # Таблица агрегированной реф-статистики звёзд
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS ref_stars_stats (
-                    user_id BIGINT NOT NULL,
-                    chat_id BIGINT NOT NULL,
-                    stars_received INTEGER DEFAULT 0,
-                    stars_spent INTEGER DEFAULT 0,
-                    stars_refunded INTEGER DEFAULT 0,
-                    stars_withdrawn INTEGER DEFAULT 0,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (user_id, chat_id)
-                )
-            ''')
-            add_column_if_missing('ref_stars_stats', 'stars_received', 'INTEGER DEFAULT 0')
-            add_column_if_missing('ref_stars_stats', 'stars_spent', 'INTEGER DEFAULT 0')
-            add_column_if_missing('ref_stars_stats', 'stars_refunded', 'INTEGER DEFAULT 0')
-            add_column_if_missing('ref_stars_stats', 'stars_withdrawn', 'INTEGER DEFAULT 0')
+            if 'chat_id' not in columns:
+                cursor.execute('ALTER TABLE players ADD COLUMN chat_id BIGINT')
+                conn.commit()
+
+            # Ensure chat_configs has columns for tracking title and total stars
+            chat_conf_cols = get_columns('chat_configs')
+            if 'stars_total' not in chat_conf_cols:
+                try:
+                    cursor.execute('ALTER TABLE chat_configs ADD COLUMN stars_total INTEGER DEFAULT 0')
+                    conn.commit()
+                except Exception:
+                    pass
+            if 'chat_title' not in chat_conf_cols:
+                try:
+                    cursor.execute('ALTER TABLE chat_configs ADD COLUMN chat_title TEXT')
+                    conn.commit()
+                except Exception:
+                    pass
+
+            if 'xp' not in columns:
+                cursor.execute('ALTER TABLE players ADD COLUMN xp INTEGER DEFAULT 0')
+                conn.commit()
+
+            if 'level' not in columns:
+                cursor.execute('ALTER TABLE players ADD COLUMN level INTEGER DEFAULT 0')
+                conn.commit()
 
             # CRITICAL: Migrate players table to use composite primary key (user_id, chat_id)
-            pk_cols = []
-            if type(cursor).__module__.startswith('sqlite3'):
-                cursor.execute("PRAGMA table_info(players)")
-                pk_cols = [r[1] for r in cursor.fetchall() if r[5] == 1]
-            else:
-                cursor.execute(
-                    """
-                    SELECT kcu.column_name
-                    FROM information_schema.table_constraints tc
-                    JOIN information_schema.key_column_usage kcu
-                      ON tc.constraint_name = kcu.constraint_name
-                      AND tc.table_schema = kcu.table_schema
-                    WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_name = %s
-                    """,
-                    ('players',)
-                )
-                pk_cols = [r[0] for r in cursor.fetchall()]
+            cursor.execute(
+                """
+                SELECT kcu.column_name
+                FROM information_schema.table_constraints tc
+                JOIN information_schema.key_column_usage kcu
+                  ON tc.constraint_name = kcu.constraint_name
+                  AND tc.table_schema = kcu.table_schema
+                WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_name = %s
+                """,
+                ('players',)
+            )
+            pk_cols = [r[0] for r in cursor.fetchall()]
 
             if pk_cols == ['user_id']:
                 # Need to recreate table with composite key
@@ -837,19 +808,12 @@ class Database:
                 ''')
 
                 # Copy data from old table, normalizing NULL chat_id to -1
-                if type(cursor).__module__.startswith('sqlite3'):
-                    cursor.execute('''
-                        INSERT OR IGNORE INTO players_new (user_id, chat_id, username, coins, stars, xp, level, current_rod, current_bait, current_location, last_fish_time, is_banned, ban_until, created_at, ref, ref_link, last_net_use_time)
-                        SELECT user_id, COALESCE(chat_id, -1), username, coins, stars, COALESCE(xp, 0), COALESCE(level, 0), current_rod, current_bait, current_location, last_fish_time, is_banned, ban_until, created_at, ref, ref_link, last_net_use_time
-                        FROM players
-                    ''')
-                else:
-                    cursor.execute('''
-                        INSERT INTO players_new (user_id, chat_id, username, coins, stars, xp, level, current_rod, current_bait, current_location, last_fish_time, is_banned, ban_until, created_at, ref, ref_link, last_net_use_time)
-                        SELECT user_id, COALESCE(chat_id, -1), username, coins, stars, COALESCE(xp, 0), COALESCE(level, 0), current_rod, current_bait, current_location, last_fish_time, is_banned, ban_until, created_at, ref, ref_link, last_net_use_time
-                        FROM players
-                        ON CONFLICT (user_id, chat_id) DO NOTHING
-                    ''')
+                cursor.execute('''
+                    INSERT INTO players_new (user_id, chat_id, username, coins, stars, xp, level, current_rod, current_bait, current_location, last_fish_time, is_banned, ban_until, created_at, ref, ref_link, last_net_use_time)
+                    SELECT user_id, COALESCE(chat_id, -1), username, coins, stars, COALESCE(xp, 0), COALESCE(level, 0), current_rod, current_bait, current_location, last_fish_time, is_banned, ban_until, created_at, ref, ref_link, last_net_use_time
+                    FROM players
+                    ON CONFLICT (user_id, chat_id) DO NOTHING
+                ''')
 
                 # Attempt to replace the old players table only if nothing
                 # references it via foreign key constraints. If other objects
@@ -925,15 +889,13 @@ class Database:
             ensure_column('star_transactions', 'chat_title', 'TEXT')
             ensure_column('player_rods', 'chat_id', 'INTEGER')
             ensure_column('player_nets', 'chat_id', 'INTEGER')
-            ensure_column('players', 'last_harpoon_use_time', 'TEXT')
-            ensure_column('players', 'active_feeder_type', 'TEXT')
-            ensure_column('players', 'active_feeder_bonus', 'INTEGER DEFAULT 0')
-            ensure_column('players', 'feeder_expires_at', 'TEXT')
-            ensure_column('players', 'echosounder_expires_at', 'TEXT')
             ensure_column('chat_configs', 'admin_ref_link', 'TEXT')
             ensure_column('chat_configs', 'chat_invite_link', 'TEXT')
             ensure_column('user_ref_links', 'chat_invite_link', 'TEXT')
             ensure_column('caught_fish', 'chat_id', 'INTEGER')
+            ensure_column('players', 'consecutive_casts_at_location', 'INTEGER DEFAULT 0')
+            ensure_column('players', 'last_fishing_location', 'TEXT')
+            ensure_column('players', 'population_penalty', 'REAL DEFAULT 0.0')
 
             # Ensure unique index for ON CONFLICT targets that expect (user_id, chat_id)
             try:
@@ -958,13 +920,10 @@ class Database:
                     row = cursor.fetchone()
                     if row and row[0] != 'bigint':
                         try:
-                            # Use a safe USING expression that converts only numeric text to bigint,
-                            # setting non-numeric values to NULL to avoid cast errors.
-                            safe_using = (
-                                "USING (CASE WHEN COALESCE(" + column_name + "::text, '') ~ '^[0-9]+$' "
-                                "THEN (" + column_name + "::text)::bigint ELSE NULL END)"
-                            )
-                            cursor.execute(f'ALTER TABLE {table_name} ALTER COLUMN {column_name} TYPE BIGINT {safe_using}')
+                            # Direct cast INTEGER -> BIGINT is always safe and lossless.
+                            # Avoids the old '^[0-9]+$' regex which incorrectly converted
+                            # negative Telegram group chat IDs (e.g. -1001234567890) to NULL.
+                            cursor.execute(f'ALTER TABLE {table_name} ALTER COLUMN {column_name} TYPE BIGINT USING {column_name}::bigint')
                             conn.commit()
                         except Exception:
                             try:
@@ -1006,129 +965,74 @@ class Database:
                 except Exception:
                     pass
 
+            # Force caught_fish.chat_id to BIGINT unconditionally.
+            # Telegram supergroup IDs like -1001234567890 exceed 32-bit INTEGER range.
+            # ALTER TABLE ... TYPE BIGINT is a no-op if column is already BIGINT.
+            for _tbl, _col in [
+                ('caught_fish', 'chat_id'),
+                ('players', 'chat_id'),
+                ('players', 'user_id'),
+                ('player_rods', 'chat_id'),
+                ('player_rods', 'user_id'),
+                ('player_nets', 'chat_id'),
+                ('player_nets', 'user_id'),
+                ('star_transactions', 'chat_id'),
+                ('star_transactions', 'user_id'),
+            ]:
+                try:
+                    cursor.execute(
+                        f'ALTER TABLE {_tbl} ALTER COLUMN {_col} TYPE BIGINT USING {_col}::bigint'
+                    )
+                    conn.commit()
+                    logger.info("Ensured %s.%s is BIGINT", _tbl, _col)
+                except Exception as _e:
+                    logger.warning("ALTER %s.%s BIGINT skipped: %s", _tbl, _col, _e)
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
 
-                # ===== Методы для /ref и вывода/вывода звёзд =====
-                def get_ref_access_chats(self, user_id: int) -> List[Dict[str, Any]]:
-                    """Получить чаты, где пользователь имеет доступ к реферальному выводу"""
-                    with self._connect() as conn:
-                        cursor = conn.cursor()
-                        cursor.execute('''
-                            SELECT chat_id, chat_title, stars_total
-                            FROM chat_configs
-                            WHERE admin_user_id = ? AND is_configured = 1
-                        ''', (user_id,))
-                        rows = cursor.fetchall()
-                        cols = [d[0] for d in cursor.description] if cursor.description else []
-                        return [dict(zip(cols, row)) for row in rows]
-
-                def get_chat_title(self, chat_id: int) -> str:
-                    """Получить название чата по chat_id"""
-                    with self._connect() as conn:
-                        cursor = conn.cursor()
-                        cursor.execute('SELECT chat_title FROM chat_configs WHERE chat_id = ?', (chat_id,))
-                        row = cursor.fetchone()
-                        return row[0] if row and row[0] else str(chat_id)
-
-                def get_chat_stars_total(self, chat_id: int) -> int:
-                    """Получить общее количество звёзд в чате"""
-                    with self._connect() as conn:
-                        cursor = conn.cursor()
-                        cursor.execute('SELECT COALESCE(stars_total, 0) FROM chat_configs WHERE chat_id = ?', (chat_id,))
-                        row = cursor.fetchone()
-                        return int(row[0]) if row else 0
-
-                def get_chat_refunds_total(self, chat_id: int) -> int:
-                    """Получить сумму всех выведенных/возвращённых звёзд по чату"""
-                    with self._connect() as conn:
-                        cursor = conn.cursor()
-                        cursor.execute('''
-                            SELECT COALESCE(SUM(total_amount), 0)
-                            FROM star_transactions
-                            WHERE chat_id = ? AND refund_status IN ("approved", "refunded")
-                        ''', (chat_id,))
-                        row = cursor.fetchone()
-                        return int(row[0]) if row else 0
-
-                def get_available_stars_for_withdraw(self, chat_id: int) -> int:
-                    """Получить количество звёзд, доступных для вывода в чате"""
-                    total = self.get_chat_stars_total(chat_id)
-                    withdrawn = self.get_chat_refunds_total(chat_id)
-                    return max(0, total - withdrawn)
-
-                def get_withdrawn_stars(self, chat_id: int) -> int:
-                    """Получить количество уже выведенных звёзд в чате"""
-                    return self.get_chat_refunds_total(chat_id)
-
-                def mark_stars_withdrawn(self, chat_id: int, amount: int, user_id: int, admin_id: int, status: str = "approved") -> bool:
-                    """Отметить вывод звёзд (создать транзакцию)"""
-                    with self._connect() as conn:
-                        cursor = conn.cursor()
-                        cursor.execute('''
-                            INSERT INTO star_transactions (user_id, total_amount, chat_id, chat_title, refund_status)
-                            VALUES (?, ?, ?, ?, ?)
-                        ''', (user_id, amount, chat_id, self.get_chat_title(chat_id), status))
-                        conn.commit()
-                        return cursor.rowcount > 0
             # Populate chat_id in player_rods and player_nets and caught_fish
-            if type(cursor).__module__.startswith('sqlite3'):
-                # SQLite: просто берем максимальный chat_id для каждого user_id, если он числовой
-                cursor.execute('''
-                    UPDATE player_rods
-                    SET chat_id = (
-                        SELECT MAX(chat_id) FROM players p WHERE p.user_id = player_rods.user_id AND CAST(chat_id AS TEXT) GLOB '[0-9]*'
-                    )
-                    WHERE chat_id IS NULL OR chat_id < 1
-                ''')
-            else:
-                cursor.execute('''
-                    UPDATE player_rods
-                    SET chat_id = (
-                        SELECT MAX(
-                            CASE WHEN COALESCE(p.chat_id::text, '') ~ '^[0-9]+$' THEN (p.chat_id::text)::bigint ELSE NULL END
-                        ) FROM players p WHERE p.user_id = player_rods.user_id
-                    )
-                    WHERE chat_id IS NULL OR chat_id < 1
-                ''')
+            # Use p.chat_id directly — the old regex '^[0-9]+$' incorrectly excluded
+            # negative Telegram group chat IDs, setting them to NULL.
+            cursor.execute('''
+                UPDATE player_rods
+                SET chat_id = (
+                    SELECT p.chat_id
+                    FROM players p
+                    WHERE p.user_id = player_rods.user_id AND p.chat_id IS NOT NULL AND p.chat_id != 0
+                    ORDER BY p.chat_id
+                    LIMIT 1
+                )
+                WHERE chat_id IS NULL OR chat_id = 0
+            ''')
             conn.commit()
 
-            if type(cursor).__module__.startswith('sqlite3'):
-                cursor.execute('''
-                    UPDATE player_nets
-                    SET chat_id = (
-                        SELECT MAX(chat_id) FROM players p WHERE p.user_id = player_nets.user_id AND CAST(chat_id AS TEXT) GLOB '[0-9]*'
-                    )
-                    WHERE chat_id IS NULL OR chat_id < 1
-                ''')
-                conn.commit()
-                cursor.execute('''
-                    UPDATE caught_fish
-                    SET chat_id = (
-                        SELECT MAX(chat_id) FROM players p WHERE p.user_id = caught_fish.user_id AND CAST(chat_id AS TEXT) GLOB '[0-9]*'
-                    )
-                    WHERE chat_id IS NULL OR chat_id < 1
-                ''')
-                conn.commit()
-            else:
-                cursor.execute('''
-                    UPDATE player_nets
-                    SET chat_id = (
-                        SELECT MAX(
-                            CASE WHEN COALESCE(p.chat_id::text, '') ~ '^[0-9]+$' THEN (p.chat_id::text)::bigint ELSE NULL END
-                        ) FROM players p WHERE p.user_id = player_nets.user_id
-                    )
-                    WHERE chat_id IS NULL OR chat_id < 1
-                ''')
-                conn.commit()
-                cursor.execute('''
-                    UPDATE caught_fish
-                    SET chat_id = (
-                        SELECT MAX(
-                            CASE WHEN COALESCE(p.chat_id::text, '') ~ '^[0-9]+$' THEN (p.chat_id::text)::bigint ELSE NULL END
-                        ) FROM players p WHERE p.user_id = caught_fish.user_id
-                    )
-                    WHERE chat_id IS NULL OR chat_id < 1
-                ''')
-                conn.commit()
+            cursor.execute('''
+                UPDATE player_nets
+                SET chat_id = (
+                    SELECT p.chat_id
+                    FROM players p
+                    WHERE p.user_id = player_nets.user_id AND p.chat_id IS NOT NULL AND p.chat_id != 0
+                    ORDER BY p.chat_id
+                    LIMIT 1
+                )
+                WHERE chat_id IS NULL OR chat_id = 0
+            ''')
+            conn.commit()
+
+            cursor.execute('''
+                UPDATE caught_fish
+                SET chat_id = (
+                    SELECT p.chat_id
+                    FROM players p
+                    WHERE p.user_id = caught_fish.user_id AND p.chat_id IS NOT NULL AND p.chat_id != 0
+                    ORDER BY p.chat_id
+                    LIMIT 1
+                )
+                WHERE chat_id IS NULL OR chat_id = 0
+            ''')
+            conn.commit()
 
             # Инициализация погоды для локаций
             cursor.execute('SELECT name FROM locations')
@@ -1137,22 +1041,13 @@ class Database:
             from weather import weather_system
             for location in locations:
                 loc_name = location[0]
-                if type(cursor).__module__.startswith('sqlite3'):
-                    cursor.execute('SELECT 1 FROM weather WHERE location = ?', (loc_name,))
-                else:
-                    cursor.execute('SELECT 1 FROM weather WHERE location = %s', (loc_name,))
+                cursor.execute('SELECT 1 FROM weather WHERE location = %s', (loc_name,))
                 if not cursor.fetchone():
                     condition, temp = weather_system.generate_weather(loc_name)
-                    if type(cursor).__module__.startswith('sqlite3'):
-                        cursor.execute(
-                            'INSERT INTO weather (location, condition, temperature) VALUES (?, ?, ?)',
-                            (loc_name, condition, temp),
-                        )
-                    else:
-                        cursor.execute(
-                            'INSERT INTO weather (location, condition, temperature) VALUES (%s, %s, %s)',
-                            (loc_name, condition, temp),
-                        )
+                    cursor.execute(
+                        'INSERT INTO weather (location, condition, temperature) VALUES (%s, %s, %s)',
+                        (loc_name, condition, temp),
+                    )
                 # Ensure a global players row exists (user_id = -1, chat_id = -1)
                 try:
                     cursor.execute(
@@ -1177,6 +1072,109 @@ class Database:
                     except Exception:
                         pass
             
+            # ===== МИГРАЦИЯ: переименование рыб (убраны подписи в скобках) =====
+            # Рыбы, пойманные до переименования, теряли стоимость — исправляем имена в caught_fish.
+            _fish_renames = [
+                ("Бестер (гибрид)", "Бестер"),
+                ("Бестер (Гибрид) (Крупный)", "Бестер"),
+                ("Ишхан (Форель)", "Ишхан"),
+                ("Валаамка (Сиг)", "Валаамка"),
+                ("Белуга (Монстр)", "Белуга"),
+                ("Сом (Гигант)", "Сом"),
+                ("Калуга (Гигант)", "Калуга"),
+                ("Лещ (Крупный)", "Лещ"),
+                ("Судак (Хищник)", "Судак"),
+                ("Налим (Ночной)", "Налим"),
+                ("Нельма (Крупная)", "Нельма"),
+                ("Веслонос (Редкая)", "Веслонос"),
+                ("Плотва (Частая)", "Плотва"),
+                ("Уклейка (Мелочь)", "Уклейка"),
+                ("Ёрш (Сорная)", "Ёрш"),
+                ("Ряпушка (Мелочь)", "Ряпушка"),
+                ("Колюшка (Крошечная)", "Колюшка"),
+                ("Тигровая акула (Монстр)", "Тигровая акула"),
+                ("Акула-молот (Гигант)", "Акула-молот"),
+                ("Парусник (Быстрая)", "Парусник"),
+                ("Палтус синекорый (Дно)", "Палтус синекорый"),
+                ("Конгер (Морской угорь)", "Конгер"),
+                ("Лаврак (Сибас)", "Лаврак"),
+                ("Зубан (Дентекс)", "Зубан"),
+                ("Серриола (Амберджек)", "Серриола"),
+                ("Пеламида (Бонито)", "Пеламида"),
+                ("Пилорыл (Редкая)", "Пилорыл"),
+                ("Рыба-луна (Экзотика)", "Рыба-луна"),
+                ("Сагрина (Зеленушка)", "Сагрина"),
+                ("Скорпена (Ёрш)", "Скорпена"),
+                ("Сариола (Желтохвост)", "Сариола"),
+                ("Анчоус (Мелочь)", "Анчоус"),
+                ("Шпрот (Мелочь)", "Шпрот"),
+                ("Луна-рыба (Опах)", "Луна-рыба"),
+                ("Морской петух (Монстр)", "Морской петух"),
+            ]
+            for old_name, new_name in _fish_renames:
+                try:
+                    cursor.execute(
+                        "UPDATE caught_fish SET fish_name = %s WHERE fish_name = %s",
+                        (new_name, old_name)
+                    )
+                except Exception:
+                    try:
+                        cursor.execute(
+                            "UPDATE caught_fish SET fish_name = ? WHERE fish_name = ?",
+                            (new_name, old_name)
+                        )
+                    except Exception:
+                        pass
+
+            # Migrate echosounder to be per-user (chat_id=0) instead of per-chat
+            try:
+                cursor.execute(
+                    '''
+                    INSERT INTO player_echosounder (user_id, chat_id, expires_at)
+                    SELECT user_id, 0, MAX(expires_at)
+                    FROM player_echosounder
+                    WHERE chat_id != 0
+                    GROUP BY user_id
+                    ON CONFLICT (user_id, chat_id) DO UPDATE
+                        SET expires_at = EXCLUDED.expires_at
+                    '''
+                )
+                cursor.execute("DELETE FROM player_echosounder WHERE chat_id != 0")
+            except Exception:
+                pass
+
+            # Ensure tournaments table exists and has all required columns
+            try:
+                cursor.execute(
+                    '''CREATE TABLE IF NOT EXISTS tournaments (
+                        id SERIAL PRIMARY KEY,
+                        chat_id BIGINT,
+                        created_by BIGINT,
+                        title TEXT NOT NULL,
+                        tournament_type TEXT DEFAULT 'total_weight',
+                        starts_at TIMESTAMP NOT NULL,
+                        ends_at TIMESTAMP NOT NULL,
+                        target_fish TEXT,
+                        prize_pool INTEGER DEFAULT 50,
+                        target_location TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )'''
+                )
+            except Exception:
+                pass
+            try:
+                cursor.execute("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS prize_pool INTEGER DEFAULT 50")
+            except Exception:
+                pass
+            try:
+                cursor.execute("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+            except Exception:
+                pass
+            try:
+                cursor.execute("ALTER TABLE tournaments ADD COLUMN IF NOT EXISTS target_location TEXT")
+            except Exception:
+                pass
+
             conn.commit()
     
     def _fill_default_data(self):
@@ -1187,41 +1185,28 @@ class Database:
             # Добавление удочек с информацией о максимальном весе
             # Формат: (name, price, durability, max_durability, fish_bonus, max_weight)
             rods_data = [
-                ("Бамбуковая удочка", 0, 100, 100, 0, 20),  # стартовая удочка, макс вес 20 кг
-                ("Углепластиковая удочка", 1500, 150, 150, 5, 35),  # макс вес 35 кг
-                ("Карбоновая удочка", 4500, 200, 200, 10, 120),  # макс вес 120 кг
-                ("Золотая удочка", 15000, 300, 300, 20, 350),  # макс вес 350 кг
-                ("Удачливая удочка", 25000, 350, 350, 25, 580),  # + шанс NFT, макс вес 580 кг
-                ("Гарпун", 75000, 100, 100, 0, 10000),  # гарпун: макс вес 10 тонн, мин. 150 кг (логика в game)
+                ("Бамбуковая удочка", 0, 100, 100, 0, 30),            # стартовая удочка, макс вес 30 кг
+                ("Углепластиковая удочка", 1500, 150, 150, 5, 60),    # макс вес 60 кг
+                ("Карбоновая удочка", 4500, 200, 200, 10, 120),        # макс вес 120 кг
+                ("Золотая удочка", 15000, 300, 300, 20, 350),          # макс вес 350 кг
+                ("Удачливая удочка", 25000, 150, 150, 15, 650),        # макс вес 650 кг, ломка 140-160 уловов
             ]
             
             cursor.executemany('''
-                INSERT OR REPLACE INTO rods (name, price, durability, max_durability, fish_bonus, max_weight)
+                INSERT OR IGNORE INTO rods (name, price, durability, max_durability, fish_bonus, max_weight)
                 VALUES (?, ?, ?, ?, ?, ?)
             ''', rods_data)
 
-            # Fallback sync by name (важно для БД, где id не auto-increment по умолчанию)
-            for rod_name, rod_price, rod_durability, rod_max_durability, rod_bonus, rod_max_weight in rods_data:
-                cursor.execute(
-                    '''
-                    UPDATE rods
-                    SET price = ?, durability = ?, max_durability = ?, fish_bonus = ?, max_weight = ?
-                    WHERE name = ?
-                    ''',
-                    (rod_price, rod_durability, rod_max_durability, rod_bonus, rod_max_weight, rod_name)
-                )
-
-                if cursor.rowcount == 0:
-                    cursor.execute('SELECT COALESCE(MAX(id), 0) + 1 FROM rods')
-                    next_id_row = cursor.fetchone()
-                    next_id = int(next_id_row[0]) if next_id_row and next_id_row[0] is not None else 1
-                    cursor.execute(
-                        '''
-                        INSERT INTO rods (id, name, price, durability, max_durability, fish_bonus, max_weight)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                        ''',
-                        (next_id, rod_name, rod_price, rod_durability, rod_max_durability, rod_bonus, rod_max_weight)
-                    )
+            # Принудительное обновление max_weight для уже существующих удочек
+            rods_weight_updates = [
+                (30, "Бамбуковая удочка"),
+                (60, "Углепластиковая удочка"),
+                (120, "Карбоновая удочка"),
+                (350, "Золотая удочка"),
+                (650, "Удачливая удочка"),
+            ]
+            for max_w, rod_name in rods_weight_updates:
+                cursor.execute('UPDATE rods SET max_weight = ? WHERE name = ?', (max_w, rod_name))
             
             # Добавление локаций
             locations_data = [
@@ -1310,10 +1295,6 @@ class Database:
                 ("Крупный кусок мяса", 140, 9, "Все"),
                 ("Печень", 90, 6, "Все"),
                 ("Кусок мяса", 110, 7, "Все"),
-                # --- Кормушки ---
-                ("Кормушка простая", 500, 10, "feeder"),
-                ("Кормушка премиум", 2500, 25, "feeder"),
-                ("Кормушка звёздная", 0, 50, "feeder_star"),  # Покупка за 50 звёзд, цена в монетах = 0
             ]
 
             baits_data = [
@@ -1352,6 +1333,18 @@ class Database:
                 ("Карп Кои", "Легендарная", 3.0, 12.0, 40, 80, 220, "Городской пруд", "Лето", "Бойлы,Кукуруза,Тесто,Хлеб,Горох,Картофель,Каша,Пучок червей", 25, None),
                 ("Змееголов", "Легендарная", 4.0, 15.0, 50, 100, 260, "Городской пруд", "Лето", "Лягушонок,Живец,Кусок мяса,Блесна,Воблер,Крупный живец,Кусочки рыбы", 30, None),
                 
+                # ===== ПРУД (новые виды) =====
+                ("Канальный сомик", "Редкая", 0.3, 2.5, 25, 55, 45, "Городской пруд", "Весна,Лето,Осень", "Кусочки рыбы,Выползок,Черви,Печень,Пучок червей", 8, None),
+                ("Амурский чебачок", "Обычная", 0.01, 0.05, 5, 10, 3, "Городской пруд", "Весна,Лето,Осень", "Мотыль,Опарыш,Тесто,Хлеб", 3, None),
+                ("Солнечный окунь", "Обычная", 0.05, 0.3, 8, 18, 8, "Городской пруд", "Весна,Лето,Осень", "Черви,Муха,Мотыль,Опарыш", 4, None),
+                ("Шиповка", "Обычная", 0.01, 0.03, 4, 8, 4, "Городской пруд", "Все", "Мотыль,Мормыш,Черви", 3, None),
+                ("Бестер", "Легендарная", 1.0, 8.0, 40, 100, 200, "Городской пруд", "Все", "Сельдь,Выползок,Кусочки рыбы,Кусок мяса,Живец", 20, None),
+                ("Колюшка", "Обычная", 0.005, 0.02, 3, 7, 2, "Городской пруд", "Все", "Мотыль,Икра,Опарыш", 3, None),
+                ("Веслонос", "Легендарная", 2.0, 10.0, 50, 120, 350, "Городской пруд", "Весна,Лето,Осень", "Каша,Опарыш,Мотыль,Тесто", 30, None),
+                ("Бычок-песочник", "Обычная", 0.01, 0.08, 5, 12, 5, "Городской пруд", "Все", "Черви,Кусочки рыбы,Мотыль,Опарыш", 4, None),
+                ("Гольян", "Обычная", 0.01, 0.04, 4, 9, 3, "Городской пруд", "Весна,Лето,Осень", "Муха,Мотыль,Хлеб,Манка,Опарыш", 3, None),
+                ("Аллигаторовый панцирник", "Мифическая", 10.0, 80.0, 80, 250, 850, "Городской пруд", "Лето", "Крупный живец,Лягушонок,Кусок мяса,Блесна,Воблер", 60, None),
+
                 # ===== РЕКА =====
                 ("Плотва", "Обычная", 0.05, 0.4, 12, 28, 10, "Река", "Все", "Опарыш,Тесто,Мотыль,Черви,Хлеб,Манка,Кукуруза,Горох", 5, None),
                 ("Окунь", "Обычная", 0.1, 0.8, 15, 30, 20, "Река,Озеро", "Все", "Мотыль,Черви,Живец,Блесна,Опарыш,Маленькая блесна,Воблер,Кусочки рыбы", 6, None),
@@ -1368,7 +1361,54 @@ class Database:
                 ("Стерлядь", "Легендарная", 1.0, 6.0, 40, 80, 220, "Река", "Весна,Лето", "Личинка короеда,Черви,Опарыш,Мотыль,Икра", 20, None),
                 ("Таймень", "Легендарная", 5.0, 20.0, 60, 120, 250, "Река", "Осень", "Блесна,Воблер,Мышь,Крупный живец,Живец,Кусочки рыбы", 30, None),
                 ("Белуга", "Легендарная", 30.0, 120.0, 120, 250, 400, "Река", "Весна", "Кусочки рыбы,Крупный живец,Моллюск,Живец,Сельдь,Выползок,Кусок мяса", 60, None),
-                
+
+                # ===== РЕКА (новые виды) =====
+                ("Щука", "Редкая", 1.0, 10.0, 40, 120, 60, "Река", "Все", "Блесна,Воблер,Живец,Лягушонок,Узкая блесна,Кусочки рыбы", 18, None),
+                ("Линь", "Редкая", 0.2, 2.0, 15, 45, 30, "Река", "Весна,Лето", "Выползок,Черви,Опарыш,Тесто,Мотыль,Кукуруза,Горох", 8, None),
+                ("Усач", "Редкая", 0.5, 3.0, 25, 60, 55, "Река", "Весна,Лето,Осень", "Личинка короеда,Моллюск,Выползок,Каша,Черви", 12, None),
+                ("Чехонь", "Обычная", 0.1, 0.7, 18, 40, 15, "Река", "Весна,Лето,Осень", "Мушка,Опарыш,Мотыль,Маленькая блесна,Муха", 6, None),
+                ("Берш", "Редкая", 0.2, 1.2, 20, 45, 40, "Река", "Все", "Кусочки рыбы,Маленькая блесна,Черви,Живец,Блесна", 8, None),
+                ("Пескарь", "Обычная", 0.01, 0.05, 5, 12, 5, "Река", "Все", "Мотыль,Черви,Опарыш,Манка", 3, None),
+                ("Густера", "Обычная", 0.05, 0.4, 10, 30, 10, "Река", "Все", "Каша,Горох,Мотыль,Опарыш,Черви", 5, None),
+                ("Елец", "Обычная", 0.01, 0.08, 7, 16, 6, "Река", "Все", "Мушка,Личинка короеда,Мотыль,Хлеб,Опарыш", 4, None),
+                ("Рыбец", "Редкая", 0.3, 2.0, 20, 45, 45, "Река", "Все", "Моллюск,Опарыш,Мотыль,Личинка короеда,Черви", 10, None),
+                ("Подуст", "Обычная", 0.2, 1.0, 15, 35, 12, "Река", "Весна,Лето,Осень", "Каша,Мотыль,Опарыш,Черви,Тесто", 6, None),
+                ("Синец", "Обычная", 0.1, 0.7, 15, 35, 10, "Река", "Все", "Мотыль,Опарыш,Каша,Тесто,Черви", 5, None),
+                ("Белоглазка", "Обычная", 0.05, 0.3, 10, 25, 8, "Река", "Все", "Каша,Опарыш,Черви,Кукуруза,Тесто", 5, None),
+                ("Угорь", "Редкая", 0.2, 2.0, 30, 100, 50, "Река", "Лето,Осень", "Выползок,Кусочки рыбы,Живец,Лягушонок,Кусок мяса", 12, None),
+                ("Красноперка", "Обычная", 0.05, 0.5, 10, 25, 10, "Река", "Весна,Лето,Осень", "Кукуруза,Мушка,Хлеб,Тесто,Опарыш", 5, None),
+                ("Форель ручьевая", "Редкая", 0.2, 1.5, 20, 50, 55, "Река", "Все", "Мушка,Маленькая блесна,Кузнечик,Мотыль,Опарыш", 10, None),
+                ("Ленок", "Редкая", 0.5, 3.0, 30, 70, 90, "Река", "Весна,Лето,Осень", "Мышь,Блесна,Мушка,Личинка короеда,Воблер", 14, None),
+                ("Нельма", "Легендарная", 2.0, 15.0, 50, 130, 300, "Река", "Все", "Крупный живец,Блесна,Воблер,Кусочки рыбы,Живец", 35, None),
+                ("Муксун", "Редкая", 0.5, 3.0, 30, 70, 60, "Река", "Весна,Осень,Зима", "Мушка,Мотыль,Моллюск,Мормыш,Икра", 12, None),
+                ("Чир", "Редкая", 0.5, 2.5, 25, 60, 55, "Река", "Весна,Осень,Зима", "Моллюск,Личинка короеда,Мотыль,Мормыш", 12, None),
+                ("Сиг", "Редкая", 0.3, 2.0, 20, 55, 45, "Река", "Весна,Осень,Зима", "Мушка,Икра,Маленькая блесна,Мотыль,Мормыш", 10, None),
+                ("Осетр русский", "Легендарная", 5.0, 40.0, 70, 200, 400, "Река", "Все", "Моллюск,Пучок червей,Выползок,Кусочки рыбы,Кусок мяса", 50, None),
+                ("Севрюга", "Легендарная", 3.0, 25.0, 60, 180, 220, "Река,Море", "Весна,Осень", "Кусочки рыбы,Моллюск,Выползок,Кусок мяса", 40, None),
+                ("Шип", "Легендарная", 2.0, 12.0, 40, 120, 180, "Река,Море", "Весна,Осень", "Пучок червей,Моллюск,Личинка короеда,Черви", 30, None),
+                ("Бычок-кругляк", "Обычная", 0.01, 0.08, 5, 12, 5, "Река", "Все", "Черви,Кусочки рыбы,Мотыль,Опарыш", 4, None),
+                ("Верхогляд", "Редкая", 0.5, 3.0, 30, 70, 120, "Река", "Весна,Лето,Осень", "Живец,Воблер,Блесна,Кусочки рыбы", 18, None),
+                ("Ауха", "Редкая", 0.5, 2.0, 25, 60, 110, "Река", "Лето,Осень", "Живец,Блесна,Воблер,Кусочки рыбы", 16, None),
+                ("Калуга", "Мифическая", 20.0, 200.0, 100, 400, 800, "Река", "Весна,Лето,Осень", "Крупный живец,Кусочки рыбы,Печень,Кусок мяса,Сельдь", 70, None),
+                ("Шемая", "Редкая", 0.1, 1.0, 15, 35, 50, "Река", "Весна,Лето,Осень", "Мушка,Опарыш,Мотыль,Черви", 8, None),
+                ("Вырезуб", "Редкая", 0.5, 3.0, 25, 60, 55, "Река", "Весна,Лето,Осень", "Моллюск,Выползок,Кукуруза,Черви", 12, None),
+                ("Минога", "Редкая", 0.01, 0.2, 10, 40, 30, "Река", "Все", "Мотыль,Черви,Личинка,Опарыш", 5, None),
+                ("Голец арктический", "Редкая", 0.5, 3.0, 25, 60, 100, "Река", "Весна,Осень,Зима", "Икра,Блесна,Мормыш,Мушка", 14, None),
+                ("Байкальский омуль", "Редкая", 0.3, 1.5, 20, 50, 70, "Река", "Весна,Осень,Зима", "Мормыш,Муха,Икра,Мотыль", 12, None),
+                ("Ряпушка", "Обычная", 0.01, 0.05, 5, 12, 5, "Река", "Все", "Мотыль,Опарыш,Муха,Черви", 3, None),
+                ("Корюшка", "Редкая", 0.01, 0.1, 7, 15, 15, "Река", "Весна,Зима", "Кусочки рыбы,Мотыль,Опарыш", 5, None),
+                ("Сибирский осетр", "Легендарная", 5.0, 50.0, 70, 200, 420, "Река", "Все", "Моллюск,Выползок,Кусочки рыбы,Пучок червей,Живец", 50, None),
+                ("Кумжа", "Редкая", 1.0, 7.0, 30, 80, 180, "Река", "Весна,Лето,Осень,Зима", "Воблер,Блесна,Муха,Мушка,Живец", 18, None),
+                ("Палия", "Редкая", 1.0, 8.0, 40, 90, 180, "Река", "Весна,Осень,Зима", "Блесна,Живец,Икра,Мотыль", 18, None),
+                ("Подкаменщик", "Обычная", 0.05, 0.3, 8, 20, 6, "Река", "Все", "Мотыль,Черви,Опарыш,Кусочки рыбы", 4, None),
+                ("Чебак", "Обычная", 0.05, 0.3, 10, 22, 7, "Река", "Все", "Опарыш,Тесто,Хлеб,Мотыль,Манка", 4, None),
+                ("Голубой сом", "Легендарная", 10.0, 80.0, 80, 200, 350, "Река", "Лето,Осень", "Крупный живец,Выползок,Печень,Кусок мяса,Сельдь", 50, None),
+                ("Мальма", "Редкая", 0.5, 3.0, 25, 65, 60, "Река", "Весна,Осень,Зима", "Блесна,Мушка,Живец,Икра,Мотыль", 12, None),
+                ("Ишхан", "Легендарная", 1.0, 8.0, 35, 80, 280, "Река", "Весна,Лето,Осень,Зима", "Блесна,Мушка,Живец,Икра,Воблер", 25, None),
+                ("Зеркальный карп", "Редкая", 2.0, 15.0, 40, 90, 80, "Река", "Весна,Лето,Осень", "Кукуруза,Горох,Каша,Тесто,Бойлы,Картофель", 18, None),
+                ("Пестрый толстолобик", "Редкая", 3.0, 15.0, 50, 110, 90, "Река", "Лето", "Технопланктон,Каша,Хлеб,Тесто,Зелень", 25, None),
+                ("Валаамка", "Редкая", 0.5, 3.0, 25, 60, 130, "Озеро", "Осень,Зима", "Мормыш,Мотыль,Маленькая блесна,Икра", 18, None),
+
                 # ===== ОЗЕРО =====
                 ("Красноперка", "Обычная", 0.1, 0.5, 15, 25, 10, "Озеро", "Лето", "Тесто,Хлеб,Муха,Опарыш,Черви,Манка,Кукуруза,Мотыль", 5, None),
                 ("Густера", "Обычная", 0.15, 0.8, 18, 30, 12, "Озеро", "Лето", "Опарыш,Мотыль,Каша,Черви,Тесто,Горох", 6, None),
@@ -1381,10 +1421,41 @@ class Database:
                 ("Сиг", "Редкая", 0.8, 3.0, 35, 60, 45, "Озеро", "Осень,Зима", "Икра,Мормыш,Мотыль,Маленькая блесна,Опарыш,Черви", 12, None),
                 ("Белый амур", "Редкая", 2.0, 10.0, 50, 90, 60, "Озеро", "Лето", "Камыш,Кукуруза,Горох,Огурец,Зелень,Тесто", 20, None),
                 ("Пелядь", "Редкая", 0.8, 3.0, 35, 60, 45, "Озеро", "Зима", "Мормыш,Мотыль,Икра,Опарыш", 12, None),
-                ("Форель озерная", "Легендарная", 1.5, 6.0, 40, 70, 200, "Озеро", "Весна,Осень", "Воблер,Блесна,Живец,Икра,Кузнечик,Мушка,Опарыш,Червия,Маленькая блесна", 16, None),
+                ("Форель озерная", "Легендарная", 1.5, 6.0, 40, 70, 200, "Озеро", "Весна,Осень", "Воблер,Блесна,Живец,Икра,Кузнечик,Мушка,Опарыш,Черви,Маленькая блесна", 16, None),
                 ("Угорь", "Легендарная", 1.0, 5.0, 50, 80, 180, "Озеро", "Лето", "Выползок,Живец,Кусочки рыбы,Пучок червей,Лягушонок,Кусок мяса", 18, None),
                 ("Осетр", "Легендарная", 3.0, 25.0, 70, 140, 260, "Озеро", "Лето,Осень", "Сельдь,Кусочки рыбы,Моллюск,Выползок,Крупный живец,Живец,Икра", 35, None),
-                
+
+                # ===== ОЗЕРО (новые виды) =====
+                ("Белуга", "Мифическая", 100.0, 500.0, 150, 450, 1100, "Озеро", "Весна,Осень", "Сельдь,Кусочки рыбы,Живец,Крупный живец", 80, None),
+                ("Сом", "Легендарная", 20.0, 150.0, 100, 350, 500, "Озеро,Река", "Лето,Осень", "Выползок,Живец,Кусочки рыбы,Сельдь,Кусок мяса", 60, None),
+                ("Калуга", "Мифическая", 50.0, 500.0, 150, 450, 1000, "Озеро,Река", "Весна,Лето,Осень", "Живец,Кусочки рыбы,Выползок,Сельдь", 80, None),
+                ("Лещ", "Редкая", 2.0, 7.0, 40, 70, 80, "Озеро", "Все", "Каша,Горох,Кукуруза,Мотыль,Пучок червей,Опарыш", 18, None),
+                ("Судак", "Редкая", 2.0, 12.0, 40, 100, 90, "Озеро", "Все", "Воблер,Блесна,Живец,Узкая блесна,Кусочки рыбы", 20, None),
+                ("Налим", "Редкая", 1.0, 8.0, 40, 100, 85, "Озеро", "Весна,Осень,Зима", "Кусочки рыбы,Живец,Выползок,Пучок червей", 18, None),
+                ("Радужная форель", "Редкая", 0.5, 5.0, 30, 70, 80, "Озеро", "Все", "Икра,Муха,Воблер,Блесна,Живец,Мушка", 14, None),
+                ("Плотва", "Обычная", 0.05, 0.5, 10, 25, 8, "Озеро", "Все", "Тесто,Хлеб,Опарыш,Мотыль,Манка", 4, None),
+                ("Карп зеркальный", "Редкая", 2.0, 15.0, 40, 90, 85, "Озеро", "Весна,Лето,Осень", "Кукуруза,Горох,Каша,Тесто,Бойлы", 20, None),
+                ("Язь", "Редкая", 0.5, 3.0, 25, 60, 45, "Озеро", "Весна,Лето,Осень", "Горох,Кукуруза,Муха,Хлеб,Черви,Опарыш", 10, None),
+                ("Голавль", "Редкая", 0.5, 2.5, 20, 50, 40, "Озеро", "Весна,Лето,Осень", "Муха,Хлеб,Кукуруза,Блесна,Кузнечик", 10, None),
+                ("Уклейка", "Обычная", 0.01, 0.03, 5, 10, 3, "Озеро", "Весна,Лето,Осень", "Муха,Опарыш,Хлеб,Манка", 3, None),
+                ("Ёрш", "Обычная", 0.01, 0.05, 5, 12, 3, "Озеро", "Все", "Мотыль,Черви,Мормыш,Опарыш", 3, None),
+                ("Толстолобик пестрый", "Редкая", 3.0, 15.0, 50, 120, 180, "Озеро,Река", "Лето,Осень", "Огурец,Камыш,Каша,Тесто,Хлеб", 30, None),
+                ("Арктический голец", "Редкая", 0.5, 3.0, 25, 60, 120, "Озеро", "Весна,Осень,Зима", "Икра,Блесна,Мормыш,Мотыль", 18, None),
+                ("Омуль", "Редкая", 0.3, 2.0, 20, 55, 60, "Озеро", "Все", "Мормыш,Муха,Икра,Мотыль,Опарыш", 12, None),
+                ("Нельма", "Легендарная", 5.0, 20.0, 60, 130, 320, "Озеро", "Весна,Осень,Зима", "Блесна,Воблер,Живец,Кусочки рыбы", 40, None),
+                ("Веслонос", "Легендарная", 2.0, 10.0, 50, 120, 320, "Озеро", "Весна,Лето,Осень", "Каша,Тесто,Мотыль,Опарыш", 30, None),
+                ("Кумжа", "Редкая", 1.0, 7.0, 30, 80, 170, "Озеро", "Весна,Лето,Осень,Зима", "Воблер,Блесна,Муха,Мушка,Живец", 18, None),
+                ("Палия", "Редкая", 1.0, 8.0, 40, 90, 170, "Озеро", "Весна,Осень,Зима", "Блесна,Живец,Икра,Мотыль", 18, None),
+                ("Ряпушка", "Обычная", 0.01, 0.05, 5, 12, 4, "Озеро", "Все", "Мотыль,Опарыш,Муха,Черви", 3, None),
+                ("Корюшка", "Редкая", 0.01, 0.1, 7, 15, 15, "Озеро", "Весна,Зима", "Кусочки рыбы,Мотыль,Опарыш", 5, None),
+                ("Берш", "Редкая", 0.2, 1.2, 20, 45, 40, "Озеро", "Все", "Живец,Блесна,Черви,Кусочки рыбы", 8, None),
+                ("Белоглазка", "Обычная", 0.05, 0.3, 10, 25, 7, "Озеро", "Все", "Каша,Опарыш,Черви,Тесто", 4, None),
+                ("Хариус", "Редкая", 0.2, 1.5, 20, 50, 45, "Озеро", "Весна,Лето,Осень,Зима", "Муха,Блесна,Икра,Мотыль,Мушка", 10, None),
+                ("Колюшка", "Обычная", 0.005, 0.02, 3, 7, 2, "Озеро", "Все", "Мотыль,Икра,Опарыш", 3, None),
+                ("Американский сомик", "Редкая", 0.3, 2.5, 25, 55, 45, "Озеро", "Весна,Лето,Осень", "Выползок,Кусочки рыбы,Хлеб,Черви", 8, None),
+                ("Озерный гольян", "Обычная", 0.01, 0.04, 4, 9, 3, "Озеро", "Весна,Лето,Осень", "Мотыль,Муха,Хлеб,Манка", 3, None),
+                ("Бестер", "Легендарная", 3.0, 15.0, 50, 130, 260, "Озеро", "Все", "Сельдь,Выползок,Кусочки рыбы,Живец,Кусок мяса", 35, None),
+
                 # ===== МОРЕ =====
                 ("Сельдь", "Обычная", 0.2, 0.8, 20, 35, 15, "Море", "Все", "Креветка,Опарыш,Морской червь,Кусочки рыбы,Блесна", 6, None),
                 ("Ставрида", "Обычная", 0.3, 1.0, 25, 40, 18, "Море", "Лето,Осень", "Блесна,Креветка,Кусочки рыбы,Пилькер,Воблер", 8, None),
@@ -1401,131 +1472,44 @@ class Database:
                 ("Рыба-меч", "Легендарная", 20.0, 110.0, 120, 250, 500, "Море", "Лето,Осень", "Крупный живец,Кальмар,Туша рыбы,Воблер,Сардина,Живец", 60, None),
                 ("Марлин", "Легендарная", 20.0, 120.0, 140, 300, 600, "Море", "Осень", "Воблер,Спрут,Крупный живец,Кальмар,Туша рыбы,Живец", 60, None),
                 ("Белая акула", "Легендарная", 50.0, 300.0, 200, 500, 900, "Море", "Лето", "Туша рыбы,Крупный живец,Кусок мяса,Крупный кусок мяса,Кальмар,Спрут", 80, None),
+
+                # ===== МОРЕ (новые виды) =====
+                ("Тигровая акула", "Мифическая", 100.0, 700.0, 200, 550, 1500, "Море", "Лето,Осень,Зима", "Туша рыбы,Крупный кусок мяса,Спрут,Кальмар", 80, None),
+                ("Акула-молот", "Мифическая", 80.0, 400.0, 150, 600, 1200, "Море", "Весна,Лето,Осень", "Крупный живец,Кальмар,Туша рыбы,Спрут", 80, None),
+                ("Акула Мако", "Легендарная", 50.0, 300.0, 150, 400, 750, "Море", "Весна,Лето,Осень,Зима", "Сардина,Пилькер,Крупный живец,Кальмар", 65, None),
+                ("Лисья акула", "Легендарная", 40.0, 250.0, 150, 500, 650, "Море", "Весна,Лето,Осень,Зима", "Живец,Кальмар,Блесна,Пилькер", 60, None),
+                ("Парусник", "Легендарная", 15.0, 100.0, 100, 340, 600, "Море", "Весна,Лето,Осень", "Воблер,Пилькер,Сардина,Спрут,Кальмар", 55, None),
+                ("Ваху", "Редкая", 5.0, 50.0, 60, 200, 200, "Море", "Весна,Лето,Осень", "Пилькер,Воблер,Кусочки рыбы,Сардина", 30, None),
+                ("Барракуда", "Редкая", 3.0, 30.0, 50, 180, 150, "Море", "Все", "Воблер,Блесна,Живец,Кусочки рыбы,Пилькер", 25, None),
+                ("Палтус синекорый", "Легендарная", 20.0, 200.0, 80, 250, 600, "Море", "Осень,Зима", "Моллюск,Кусочки рыбы,Кальмар,Сельдь", 55, None),
+                ("Скат-хвостокол", "Редкая", 5.0, 60.0, 40, 180, 160, "Море", "Все", "Морской червь,Моллюск,Кусочки рыбы,Кальмар", 25, None),
+                ("Морской чёрт", "Мифическая", 5.0, 40.0, 40, 180, 300, "Море", "Все", "Кальмар,Живец,Кусочки рыбы,Крупный живец", 40, None),
+                ("Конгер", "Редкая", 5.0, 50.0, 80, 300, 320, "Море", "Все", "Крупный кусок мяса,Кальмар,Живец,Кусок мяса", 40, None),
+                ("Луфарь", "Обычная", 1.0, 15.0, 30, 100, 35, "Море", "Весна,Лето,Осень", "Пилькер,Блесна,Сардина,Живец", 18, None),
+                ("Лаврак", "Обычная", 1.0, 12.0, 30, 100, 40, "Море", "Все", "Креветка,Воблер,Морской червь,Блесна", 18, None),
+                ("Зубан", "Редкая", 2.0, 15.0, 40, 100, 120, "Море", "Все", "Кальмар,Живец,Пилькер,Кусочки рыбы", 25, None),
+                ("Групер гигантский", "Мифическая", 50.0, 200.0, 100, 250, 950, "Море", "Лето,Осень", "Крупный живец,Спрут,Кусок мяса,Кальмар", 75, None),
+                ("Серриола", "Редкая", 5.0, 80.0, 60, 190, 200, "Море", "Все", "Живец,Пилькер,Кальмар,Воблер", 30, None),
+                ("Пеламида", "Обычная", 1.0, 10.0, 35, 90, 40, "Море", "Все", "Блесна,Сардина,Воблер,Живец,Пилькер", 18, None),
+                ("Пилорыл", "Мифическая", 100.0, 400.0, 200, 700, 1300, "Море", "Лето,Осень", "Моллюск,Кусочки рыбы,Кальмар,Крупный кусок мяса", 80, None),
+                ("Рыба-луна", "Мифическая", 200.0, 1500.0, 100, 330, 2000, "Море", "Лето,Осень", "Спрут,Кальмар,Моллюск,Медуза", 80, None),
+                ("Сагрина", "Обычная", 0.1, 0.5, 10, 25, 10, "Море", "Весна,Лето,Осень", "Креветка,Тесто,Мякиш хлеба,Морской червь", 5, None),
+                ("Морской петух", "Мифическая", 30.0, 180.0, 70, 230, 900, "Море", "Все", "Крупный живец,Туша рыбы,Кальмар,Морской червь", 75, None),
+                ("Скорпена", "Редкая", 0.2, 2.0, 15, 40, 55, "Море", "Все", "Кусочки рыбы,Креветка,Живец,Морской червь", 12, None),
+                ("Лихия", "Редкая", 3.0, 25.0, 40, 110, 150, "Море", "Весна,Лето,Осень", "Воблер,Живец,Сардина,Пилькер", 25, None),
+                ("Сариола", "Редкая", 5.0, 40.0, 50, 150, 160, "Море", "Все", "Пилькер,Кальмар,Блесна,Живец", 25, None),
+                ("Морской дракон", "Редкая", 0.1, 1.0, 10, 40, 55, "Море", "Все", "Морской червь,Опарыш,Креветка,Мотыль", 10, None),
+                ("Анчоус", "Обычная", 0.01, 0.03, 5, 10, 4, "Море", "Все", "Опарыш,Тесто,Мякиш хлеба,Морской червь", 3, None),
+                ("Шпрот", "Обычная", 0.01, 0.03, 5, 10, 4, "Море", "Все", "Мякиш хлеба,Тесто,Опарыш,Креветка", 3, None),
+                ("Луна-рыба", "Легендарная", 30.0, 150.0, 60, 180, 550, "Море", "Лето,Осень", "Кальмар,Спрут,Сардина,Живец", 55, None),
+                ("Каменный окунь", "Редкая", 0.2, 3.0, 15, 50, 60, "Море", "Все", "Креветка,Морской червь,Сало,Кусочки рыбы", 12, None),
+                ("Морская лисица", "Редкая", 5.0, 60.0, 40, 180, 350, "Море", "Все", "Кусочки рыбы,Сало,Моллюск,Кальмар", 45, None),
+                ("Морской черт", "Мифическая", 15.0, 100.0, 60, 200, 850, "Море", "Все", "Крупный живец,Туша рыбы,Кальмар,Спрут,Кусок мяса", 75, None),
             ]
 
-            from fish_stickers import FISH_INFO, FISH_STICKERS
+            from fish_stickers import FISH_INFO
 
             bait_name_map = {name.lower(): name for name, _, _, _ in base_baits_data}
-            fish_sticker_map = {name.strip(): sticker for name, sticker in FISH_STICKERS.items() if name and name.strip()}
-            existing_fish_names = {entry[0].strip() for entry in fish_data if entry and entry[0]}
-
-            rarity_map = {
-                "обычная": "Обычная",
-                "часто": "Обычная",
-                "очень часто": "Обычная",
-                "редкая": "Редкая",
-                "очень редкая": "Легендарная",
-                "легендарная": "Легендарная",
-                "мифическая": "Мифическая",
-            }
-
-            mythic_keywords = [
-                "белая акула",
-                "белуга",
-                "калуга",
-                "лисья акула",
-                "рыба-луна",
-                "луна-рыба",
-                "морской петух",
-                "морской черт",
-                "скат-хвостокол",
-                "барракуда",
-                "тигровая акула",
-            ]
-
-            def is_mythic_fish_name(name_value: str) -> bool:
-                norm = (name_value or "").strip().lower().replace('ё', 'е')
-                if not norm:
-                    return False
-                for keyword in mythic_keywords:
-                    if keyword in norm:
-                        return True
-                return False
-
-            def parse_range(raw_value: str, default_min: float, default_max: float, unit: str) -> tuple[float, float]:
-                if not raw_value:
-                    return default_min, default_max
-                text = str(raw_value).lower().replace(unit, '').replace(' ', '')
-                parts = text.split('-')
-                if len(parts) != 2:
-                    return default_min, default_max
-                try:
-                    min_v = float(parts[0].replace(',', '.'))
-                    max_v = float(parts[1].replace(',', '.'))
-                    if max_v < min_v:
-                        min_v, max_v = max_v, min_v
-                    return min_v, max_v
-                except Exception:
-                    return default_min, default_max
-
-            def infer_locations_from_habitat(habitat_value: str) -> str:
-                text = (habitat_value or '').lower()
-                locations: List[str] = []
-                if 'пруд' in text:
-                    locations.append('Городской пруд')
-                if 'рек' in text:
-                    locations.append('Река')
-                if 'озер' in text or 'озёр' in text:
-                    locations.append('Озеро')
-                if 'мор' in text:
-                    locations.append('Море')
-                if not locations:
-                    return 'Река,Озеро'
-                # удаление дублей с сохранением порядка
-                uniq: List[str] = []
-                for loc in locations:
-                    if loc not in uniq:
-                        uniq.append(loc)
-                return ','.join(uniq)
-
-            def default_price_for_rarity(rarity_value: str) -> int:
-                if rarity_value == 'Мифическая':
-                    return 650
-                if rarity_value == 'Легендарная':
-                    return 260
-                if rarity_value == 'Редкая':
-                    return 70
-                return 18
-
-            # Автодобавление всех отсутствующих видов из fish_stickers,
-            # чтобы они были в таблице fish и реально ловились.
-            for fish_name, sticker_filename in fish_sticker_map.items():
-                fish_name = fish_name.strip()
-                if not fish_name or fish_name == 'Рыбнадзор' or fish_name in existing_fish_names:
-                    continue
-
-                info = FISH_INFO.get(fish_name, {})
-                rarity_raw = str(info.get('rarity', 'Редкая')).strip().lower()
-                rarity = rarity_map.get(rarity_raw, 'Редкая')
-                if is_mythic_fish_name(fish_name):
-                    rarity = 'Мифическая'
-
-                min_weight, max_weight = parse_range(str(info.get('weight_range', '')), 0.3, 3.5, 'кг')
-                min_length, max_length = parse_range(str(info.get('size_range', '')), 20.0, 65.0, 'см')
-
-                locations = infer_locations_from_habitat(str(info.get('habitat', '')))
-                seasons = str(info.get('seasons', 'Все'))
-                suitable_baits = str(info.get('nutrition', 'Все'))
-
-                price = default_price_for_rarity(rarity)
-                max_rod_weight = max(10, int(max_weight * 1.5))
-                required_level = 0 if rarity == 'Обычная' else (10 if rarity == 'Редкая' else (20 if rarity == 'Легендарная' else 30))
-
-                fish_data.append((
-                    fish_name,
-                    rarity,
-                    min_weight,
-                    max_weight,
-                    min_length,
-                    max_length,
-                    price,
-                    locations,
-                    seasons,
-                    suitable_baits,
-                    max_rod_weight,
-                    sticker_filename,
-                ))
-                existing_fish_names.add(fish_name)
 
             def normalize_seasons(seasons_value: str) -> str:
                 if not seasons_value:
@@ -1550,22 +1534,15 @@ class Database:
 
             normalized_fish_data = []
             for entry in fish_data:
-                if len(entry) == 13:
-                    (name, rarity, min_weight, max_weight, min_length, max_length, price,
-                     locations, seasons, suitable_baits, max_rod_weight, required_level, sticker_id) = entry
-                else:
-                    (name, rarity, min_weight, max_weight, min_length, max_length, price,
-                     locations, seasons, suitable_baits, max_rod_weight, sticker_id) = entry
-                    required_level = 0
+                (name, rarity, min_weight, max_weight, min_length, max_length, price,
+                 locations, seasons, suitable_baits, max_rod_weight, sticker_id) = entry
+                required_level = 0
                 info = FISH_INFO.get(name)
-                if not sticker_id:
-                    sticker_id = fish_sticker_map.get(name)
                 if info:
-                    seasons = normalize_seasons(info.get("seasons", ""))
+                    # Сезоны берём из database.py (корректны по локации);
+                    # FISH_INFO переопределял бы их одинаково для всех локаций
+                    # из-за дублирующихся ключей (реки/озёра с одним именем).
                     suitable_baits = normalize_baits(info.get("nutrition", ""))
-                if is_mythic_fish_name(name):
-                    rarity = 'Мифическая'
-                    required_level = max(int(required_level or 0), 30)
                 normalized_fish_data.append((
                     name, rarity, min_weight, max_weight, min_length, max_length, price,
                     locations, seasons, suitable_baits, max_rod_weight, required_level, sticker_id
@@ -1577,27 +1554,32 @@ class Database:
                 INSERT OR REPLACE INTO fish (name, rarity, min_weight, max_weight, min_length, max_length, price, locations, seasons, suitable_baits, max_rod_weight, required_level, sticker_id)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', fish_data)
+            # Никакой рыбе не нужно набирать уровень — сбрасываем required_level в 0 для всех существующих записей
+            cursor.execute('UPDATE fish SET required_level = 0')
             
             # Добавление мусора для реки
             trash_data = [
-                ("Коряга", 0.5, 2, "Река", None),
-                ("Старая шина", 2.0, 1, "Река", None),
-                ("Консервная банка", 0.1, 1, "Река", None),
-                ("Ботинок", 0.3, 2, "Река", None),
-                ("Пластиковая бутылка", 0.05, 0, "Река", None),
-                ("Ржавый крючок", 0.02, 5, "Река", None),
-                ("Кусок трубы", 1.5, 3, "Река", None),
-                ("Поломанная удочка", 1.0, 10, "Река", None),
-                ("Рыболовная сетка", 0.8, 5, "Река", None),
-                ("Деревянная доска", 2.5, 4, "Река", None),
-                ("Старый якорь", 3.0, 15, "Река", None),
-                ("Веревка", 0.3, 1, "Река", None),
+                ("Коряга", 0.5, 2, "Все", None),
+                ("Старая шина", 2.0, 1, "Все", None),
+                ("Консервная банка", 0.1, 1, "Все", None),
+                ("Ботинок", 0.3, 2, "Все", None),
+                ("Пластиковая бутылка", 0.05, 0, "Все", None),
+                ("Ржавый крючок", 0.02, 5, "Все", None),
+                ("Кусок трубы", 1.5, 3, "Все", None),
+                ("Поломанная удочка", 1.0, 10, "Все", None),
+                ("Рыболовная сетка", 0.8, 5, "Все", None),
+                ("Деревянная доска", 2.5, 4, "Все", None),
+                ("Старый якорь", 3.0, 15, "Все", None),
+                ("Веревка", 0.3, 1, "Все", None),
             ]
             
             cursor.executemany('''
                 INSERT OR IGNORE INTO trash (name, weight, price, locations, sticker_id)
                 VALUES (?, ?, ?, ?, ?)
             ''', trash_data)
+
+            # Обновляем locations всех мусорных предметов до Все (чтобы они попадали в сеть на любой локации)
+            cursor.execute("UPDATE trash SET locations = 'Все' WHERE locations = 'Река'")
             
             # Добавление сетей
             # Формат: (name, price, fish_count, cooldown_hours, max_uses, description)
@@ -1845,9 +1827,7 @@ class Database:
         # Allow only specific fields to be updated to avoid SQL injection
         allowed_fields = {
             'username', 'coins', 'stars', 'xp', 'level', 'current_rod', 'current_bait',
-            'current_location', 'last_fish_time', 'is_banned', 'ban_until', 'ref', 'ref_link',
-            'last_net_use_time', 'last_harpoon_use_time',
-            'active_feeder_type', 'active_feeder_bonus', 'feeder_expires_at', 'echosounder_expires_at'
+            'current_location', 'last_fish_time', 'is_banned', 'ban_until', 'ref', 'ref_link', 'last_net_use_time'
         }
 
         # Prevent passing chat_id as a kwarg (it is a positional arg here)
@@ -1906,9 +1886,7 @@ class Database:
                 WHERE locations LIKE ? AND (seasons LIKE ? OR seasons LIKE '%Все%')
             '''
             params: List[Union[str, int]] = [f"%{location}%", f"%{season}%"]
-            if min_level is not None:
-                query += " AND required_level <= ?"
-                params.append(min_level)
+            # min_level игнорируется: никакой рыбе не нужно уровень
             query += " ORDER BY rarity"
             cursor.execute(query, params)
             rows = cursor.fetchall()
@@ -1924,9 +1902,7 @@ class Database:
                 WHERE locations LIKE ?
             '''
             params: List[Union[str, int]] = [f"%{location}%"]
-            if min_level is not None:
-                query += " AND required_level <= ?"
-                params.append(min_level)
+            # min_level игнорируется: никакой рыбе не нужно уровень
             query += " ORDER BY rarity"
             cursor.execute(query, params)
             rows = cursor.fetchall()
@@ -1954,34 +1930,36 @@ class Database:
         """Добавить пойманную рыбу"""
         normalized_name = fish_name.strip() if isinstance(fish_name, str) else fish_name
         try:
-            with self._connect() as conn:
-                cursor = conn.cursor()
-                cursor.execute('''
-                    INSERT INTO caught_fish (user_id, chat_id, fish_name, weight, length, location)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', (user_id, chat_id, normalized_name, weight, length, location))
-                conn.commit()
+            chat_id_to_store = int(chat_id) if chat_id is not None else None
+        except (TypeError, ValueError):
+            chat_id_to_store = None
+
+        logger.info(
+            "add_caught_fish INPUT: user_id=%s chat_id=%s (raw=%s, type=%s) fish=%s weight=%s length=%s location=%s",
+            user_id, chat_id_to_store, chat_id, type(chat_id).__name__,
+            normalized_name, weight, length, location
+        )
+
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'INSERT INTO caught_fish (user_id, chat_id, fish_name, weight, length, location)'
+                ' VALUES (%s, %s, %s, %s, %s, %s)'
+                ' RETURNING id, user_id, chat_id, fish_name, weight, length, location, caught_at',
+                (user_id, chat_id_to_store, normalized_name, float(weight), float(length), location)
+            )
+            saved = cursor.fetchone()
+
+        if saved:
             logger.info(
-                "Caught fish saved: user=%s chat_id=%s fish=%s weight=%.2fkg length=%.1fcm location=%s",
-                user_id,
-                chat_id,
-                normalized_name,
-                float(weight or 0),
-                float(length or 0),
-                location
+                "add_caught_fish SAVED IN DB: id=%s user_id=%s chat_id=%s fish=%s weight=%s length=%s location=%s caught_at=%s",
+                saved[0], saved[1], saved[2], saved[3], saved[4], saved[5], saved[6], saved[7]
             )
-        except Exception as exc:
-            logger.error(
-                "Caught fish save failed: user=%s chat_id=%s fish=%s weight=%s length=%s location=%s error=%s",
-                user_id,
-                chat_id,
-                normalized_name,
-                weight,
-                length,
-                location,
-                exc
+        else:
+            logger.warning(
+                "add_caught_fish: INSERT returned no row — possible constraint violation. user_id=%s chat_id=%s fish=%s",
+                user_id, chat_id_to_store, normalized_name
             )
-            raise
     
     def remove_caught_fish(self, fish_id: int):
         """Удалить пойманную рыбу по ID"""
@@ -2078,13 +2056,13 @@ class Database:
             }
 
     def get_total_fish_species(self) -> int:
-        """Получить общее число видов рыб в игре."""
+        """Возвращает общее количество видов рыб в каталоге."""
         with self._connect() as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT COUNT(*) FROM fish')
             row = cursor.fetchone()
-            return int(row[0]) if row and row[0] is not None else 0
-    
+            return row[0] if row else 0
+
     def get_rod(self, rod_name: str) -> Optional[Dict[str, Any]]:
         """Получить информацию об удочке"""
         with self._connect() as conn:
@@ -2095,41 +2073,6 @@ class Database:
                 return None
             columns = [description[0] for description in cursor.description]
             return dict(zip(columns, row))
-
-    def ensure_rod_catalog(self) -> None:
-        """Гарантировать наличие ключевых удочек в каталоге rods."""
-        rods_data = [
-            ("Бамбуковая удочка", 0, 100, 100, 0, 20),
-            ("Углепластиковая удочка", 1500, 150, 150, 5, 35),
-            ("Карбоновая удочка", 4500, 200, 200, 10, 120),
-            ("Золотая удочка", 15000, 300, 300, 20, 350),
-            ("Удачливая удочка", 25000, 350, 350, 25, 580),
-            ("Гарпун", 75000, 100, 100, 0, 10000),
-        ]
-
-        with self._connect() as conn:
-            cursor = conn.cursor()
-            for rod_name, rod_price, rod_durability, rod_max_durability, rod_bonus, rod_max_weight in rods_data:
-                cursor.execute(
-                    '''
-                    UPDATE rods
-                    SET price = ?, durability = ?, max_durability = ?, fish_bonus = ?, max_weight = ?
-                    WHERE name = ?
-                    ''',
-                    (rod_price, rod_durability, rod_max_durability, rod_bonus, rod_max_weight, rod_name)
-                )
-                if cursor.rowcount == 0:
-                    cursor.execute('SELECT COALESCE(MAX(id), 0) + 1 FROM rods')
-                    next_id_row = cursor.fetchone()
-                    next_id = int(next_id_row[0]) if next_id_row and next_id_row[0] is not None else 1
-                    cursor.execute(
-                        '''
-                        INSERT INTO rods (id, name, price, durability, max_durability, fish_bonus, max_weight)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                        ''',
-                        (next_id, rod_name, rod_price, rod_durability, rod_max_durability, rod_bonus, rod_max_weight)
-                    )
-            conn.commit()
     
     def get_rod_by_id(self, rod_id: int) -> Optional[Dict[str, Any]]:
         """Получить информацию об удочке по ID"""
@@ -2227,167 +2170,6 @@ class Database:
             
             conn.commit()
             return True
-
-    def get_harpoon_cooldown_remaining(self, user_id: int, chat_id: int, cooldown_minutes: int = 20) -> int:
-        """Оставшееся время КД гарпуна в секундах."""
-        player = self.get_player(user_id, chat_id)
-        if not player:
-            return 0
-
-        last_use = player.get('last_harpoon_use_time')
-        if not last_use:
-            return 0
-
-        try:
-            last_time = datetime.fromisoformat(last_use)
-        except Exception:
-            return 0
-
-        passed = datetime.now() - last_time
-        cooldown_delta = timedelta(minutes=cooldown_minutes)
-        if passed >= cooldown_delta:
-            return 0
-
-        remaining = int((cooldown_delta - passed).total_seconds())
-        return max(0, remaining)
-
-    def mark_harpoon_used(self, user_id: int, chat_id: int) -> bool:
-        """Пометить время последнего использования гарпуна."""
-        try:
-            self.update_player(user_id, chat_id, last_harpoon_use_time=datetime.now().isoformat())
-            return True
-        except Exception as e:
-            logger.error("mark_harpoon_used error: %s", e)
-            return False
-
-    def activate_feeder(self, user_id: int, chat_id: int, feeder_type: str, bonus_percent: int, duration_minutes: int = 60) -> bool:
-        """Активировать кормушку на заданное время."""
-        try:
-            expires_at = (datetime.now() + timedelta(minutes=duration_minutes)).isoformat()
-            self.update_player(
-                user_id,
-                chat_id,
-                active_feeder_type=feeder_type,
-                active_feeder_bonus=int(bonus_percent),
-                feeder_expires_at=expires_at,
-            )
-            return True
-        except Exception as e:
-            logger.error("activate_feeder error: %s", e)
-            return False
-
-    def get_active_feeder(self, user_id: int, chat_id: int) -> Optional[Dict[str, Any]]:
-        """Получить активную кормушку (если есть и не истекла)."""
-        player = self.get_player(user_id, chat_id)
-        if not player:
-            return None
-
-        feeder_type = player.get('active_feeder_type')
-        feeder_bonus = int(player.get('active_feeder_bonus') or 0)
-        expires_raw = player.get('feeder_expires_at')
-
-        if not feeder_type or not expires_raw or feeder_bonus <= 0:
-            return None
-
-        try:
-            expires_at = datetime.fromisoformat(str(expires_raw))
-        except Exception:
-            self.update_player(
-                user_id,
-                chat_id,
-                active_feeder_type=None,
-                active_feeder_bonus=0,
-                feeder_expires_at=None,
-            )
-            return None
-
-        now = datetime.now()
-        if expires_at <= now:
-            self.update_player(
-                user_id,
-                chat_id,
-                active_feeder_type=None,
-                active_feeder_bonus=0,
-                feeder_expires_at=None,
-            )
-            return None
-
-        remaining = int((expires_at - now).total_seconds())
-        return {
-            'type': feeder_type,
-            'bonus_percent': feeder_bonus,
-            'expires_at': expires_at.isoformat(),
-            'remaining_seconds': max(0, remaining),
-        }
-
-    def get_active_feeder_bonus(self, user_id: int, chat_id: int) -> int:
-        """Получить бонус активной кормушки в процентах."""
-        feeder = self.get_active_feeder(user_id, chat_id)
-        if not feeder:
-            return 0
-        return int(feeder.get('bonus_percent') or 0)
-
-    def get_feeder_cooldown_remaining(self, user_id: int, chat_id: int) -> int:
-        """Оставшееся время действия активной кормушки в секундах."""
-        feeder = self.get_active_feeder(user_id, chat_id)
-        if not feeder:
-            return 0
-        return int(feeder.get('remaining_seconds') or 0)
-
-    def activate_echosounder(self, user_id: int, chat_id: int, duration_hours: int = 24) -> bool:
-        """Активировать эхолот на заданное количество часов."""
-        try:
-            expires_at = (datetime.now() + timedelta(hours=duration_hours)).isoformat()
-            self.update_player(user_id, chat_id, echosounder_expires_at=expires_at)
-            return True
-        except Exception as e:
-            logger.error("activate_echosounder error: %s", e)
-            return False
-
-    def is_echosounder_active(self, user_id: int, chat_id: int) -> bool:
-        """Проверить, активен ли эхолот."""
-        player = self.get_player(user_id, chat_id)
-        if not player:
-            return False
-
-        expires_raw = player.get('echosounder_expires_at')
-        if not expires_raw:
-            return False
-
-        try:
-            expires_at = datetime.fromisoformat(str(expires_raw))
-        except Exception:
-            self.update_player(user_id, chat_id, echosounder_expires_at=None)
-            return False
-
-        if expires_at <= datetime.now():
-            self.update_player(user_id, chat_id, echosounder_expires_at=None)
-            return False
-
-        return True
-
-    def get_echosounder_remaining_seconds(self, user_id: int, chat_id: int) -> int:
-        """Оставшееся время действия эхолота в секундах."""
-        player = self.get_player(user_id, chat_id)
-        if not player:
-            return 0
-
-        expires_raw = player.get('echosounder_expires_at')
-        if not expires_raw:
-            return 0
-
-        try:
-            expires_at = datetime.fromisoformat(str(expires_raw))
-        except Exception:
-            self.update_player(user_id, chat_id, echosounder_expires_at=None)
-            return 0
-
-        now = datetime.now()
-        if expires_at <= now:
-            self.update_player(user_id, chat_id, echosounder_expires_at=None)
-            return 0
-
-        return max(0, int((expires_at - now).total_seconds()))
     
     def get_caught_fish(self, user_id: int, chat_id: int) -> List[Dict[str, Any]]:
         """Получить всю пойманную рыбу пользователя"""
@@ -2398,6 +2180,11 @@ class Database:
             # which caused old catches to be retroactively reassigned when a user viewed `/stats`.
             # Keep reads side-effect free; use tools/fix_caught_fish_chatid.py or admin commands
             # to perform any explicit normalization instead.
+            #
+            # JOIN uses LOWER(TRIM(...)) for case-insensitive matching so that fish stored with
+            # minor casing differences still resolve correctly from the fish/trash catalogs.
+            # trash_name is included to distinguish actual trash (t.name IS NOT NULL) from a
+            # failed JOIN with the fish table (both f.name and t.name are NULL).
             cursor.execute('''
                 SELECT cf.*, 
                        COALESCE(f.name, t.name) AS name,
@@ -2407,10 +2194,11 @@ class Database:
                        f.max_weight AS max_weight,
                        f.min_length AS min_length,
                        f.max_length AS max_length,
-                       CASE WHEN f.name IS NULL THEN 1 ELSE 0 END AS is_trash
+                       CASE WHEN f.name IS NULL THEN 1 ELSE 0 END AS is_trash,
+                       t.name AS trash_name
                 FROM caught_fish cf
-                LEFT JOIN fish f ON TRIM(cf.fish_name) = f.name
-                LEFT JOIN trash t ON TRIM(cf.fish_name) = t.name
+                LEFT JOIN fish f ON LOWER(TRIM(cf.fish_name)) = LOWER(f.name)
+                LEFT JOIN trash t ON LOWER(TRIM(cf.fish_name)) = LOWER(t.name)
                 WHERE cf.user_id = ? AND (cf.chat_id = ? OR cf.chat_id IS NULL OR cf.chat_id < 1)
                 ORDER BY cf.weight DESC
             ''', (user_id, chat_id))
@@ -2419,8 +2207,47 @@ class Database:
             columns = [description[0] for description in cursor.description]
             results = [dict(zip(columns, row)) for row in rows]
 
+            # Collect items where the JOIN failed (is_trash=1 meaning f.name IS NULL,
+            # AND trash_name IS NULL meaning not in trash table either).
+            # These are real fish whose names don't match due to encoding/case differences.
+            # We do a single batch secondary lookup to recover their catalog data.
+            orphan_indices = [
+                i for i, item in enumerate(results)
+                if item.get('is_trash') and item.get('trash_name') is None
+            ]
+            if orphan_indices:
+                orphan_names = [results[i].get('fish_name', '') for i in orphan_indices]
+                try:
+                    placeholders = ','.join(['?' for _ in orphan_names])
+                    cursor.execute(
+                        f"SELECT name, rarity, price, min_weight, max_weight, min_length, max_length "
+                        f"FROM fish WHERE LOWER(name) IN ({placeholders})",
+                        [n.lower().strip() for n in orphan_names]
+                    )
+                    lookup_rows = cursor.fetchall()
+                    fish_by_lower = {}
+                    for row in lookup_rows:
+                        fish_by_lower[str(row[0]).lower()] = {
+                            'rarity': row[1], 'price': row[2],
+                            'min_weight': row[3], 'max_weight': row[4],
+                            'min_length': row[5], 'max_length': row[6],
+                        }
+                    for i in orphan_indices:
+                        item = results[i]
+                        key = str(item.get('fish_name', '')).lower().strip()
+                        fish_row = fish_by_lower.get(key)
+                        if fish_row:
+                            item.update(fish_row)
+                            item['is_trash'] = 0
+                            item['name'] = item.get('fish_name', '')
+                except Exception:
+                    logger.exception("get_caught_fish: secondary orphan lookup failed")
+
             for item in results:
-                if item.get('is_trash'):
+                # Only skip price recalculation for genuine trash items (in the trash catalog).
+                # Fish with is_trash=1 but no trash_name match were not found in either catalog;
+                # they still get a price so they don't show as 0 coins in the shop.
+                if item.get('is_trash') and item.get('trash_name') is not None:
                     continue
                 item['price'] = self.calculate_fish_price(item, item.get('weight', 0), item.get('length', 0))
 
@@ -2435,7 +2262,7 @@ class Database:
             'Обычная': 1.15,
             'Редкая': 1.5,
             'Легендарная': 2.2,
-            'Мифическая': 3.0,
+            'Мифическая': 5.0,
         }
         rarity_multiplier = rarity_multipliers.get(rarity, 1.0)
 
@@ -2553,8 +2380,8 @@ class Database:
         rarity_base = {
             'Обычная': 60.0,
             'Редкая': 30.0,
-            'Легендарная': 10.0,
-            'Мифическая': 5.0,
+            'Легендарная': 3.0,
+            'Мифическая': 0.05,
             'Мусор': 5.0,
         }
         weights: List[float] = []
@@ -2614,6 +2441,120 @@ class Database:
         """Получить таблицу лидеров (по умолчанию - глобально за все время)"""
         return self.get_leaderboard_period(limit=limit)
 
+    def get_chat_leaderboard_period(self, chat_id: int, limit: int = 10, since: Optional[datetime] = None, until: Optional[datetime] = None) -> List[Dict[str, Any]]:
+        """Получить топ по общему весу улова в конкретном чате за период.
+        Логика идентична get_leaderboard_period (sold=0, JOIN fish),
+        но с обязательным фильтром cf.chat_id = chat_id.
+        """
+        with self._connect() as conn:
+            cursor = conn.cursor()
+
+            where_clauses: List[str] = ['cf.chat_id = %s', 'cf.sold = 0']
+            params: List = [chat_id]
+
+            if since is not None:
+                where_clauses.append('cf.caught_at >= %s')
+                params.append(since.strftime('%Y-%m-%d %H:%M:%S'))
+            if until is not None:
+                where_clauses.append('cf.caught_at <= %s')
+                params.append(until.strftime('%Y-%m-%d %H:%M:%S'))
+
+            where_sql = 'WHERE ' + ' AND '.join(where_clauses)
+
+            query = f'''
+                SELECT
+                    COALESCE(MAX(p.username), 'Неизвестно') as username,
+                    cf.user_id,
+                    COUNT(cf.id) as total_fish,
+                    COALESCE(SUM(cf.weight), 0) as total_weight
+                FROM caught_fish cf
+                JOIN fish f ON TRIM(cf.fish_name) = f.name
+                LEFT JOIN players p ON p.user_id = cf.user_id
+                {where_sql}
+                GROUP BY cf.user_id
+                ORDER BY total_weight DESC, total_fish DESC
+                LIMIT %s
+            '''
+
+            params.append(limit)
+            logger.info(
+                'get_chat_leaderboard_period QUERY: chat_id=%s since=%s until=%s limit=%s',
+                chat_id, since, until, limit
+            )
+            try:
+                cursor.execute(query, params)
+                rows = cursor.fetchall()
+                logger.info(
+                    'get_chat_leaderboard_period RESULT: %d rows for chat_id=%s',
+                    len(rows), chat_id
+                )
+                for row in rows:
+                    logger.info(
+                        '  row: username=%s user_id=%s total_fish=%s total_weight=%s',
+                        row[0], row[1], row[2], row[3]
+                    )
+                return [
+                    {
+                        'username': row[0],
+                        'user_id': row[1],
+                        'total_fish': row[2],
+                        'total_weight': row[3],
+                    }
+                    for row in rows
+                ]
+            except Exception:
+                logger.exception('get_chat_leaderboard_period failed')
+                return []
+
+    def get_users_weight_leaderboard(
+        self,
+        user_ids: List[int],
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
+        """Топ по общему весу непроданной рыбы для заданного списка user_id за период."""
+        if not user_ids:
+            return []
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            placeholders = ','.join(['%s'] * len(user_ids))
+            where_clauses = [f'cf.user_id IN ({placeholders})', 'cf.sold = 0']
+            params: List = list(user_ids)
+            if since is not None:
+                where_clauses.append('cf.caught_at >= %s')
+                params.append(since.strftime('%Y-%m-%d %H:%M:%S'))
+            if until is not None:
+                where_clauses.append('cf.caught_at <= %s')
+                params.append(until.strftime('%Y-%m-%d %H:%M:%S'))
+            where_sql = 'WHERE ' + ' AND '.join(where_clauses)
+            query = f'''
+                SELECT
+                    cf.user_id,
+                    COALESCE(MAX(p.username), 'Неизвестно') AS username,
+                    COUNT(cf.id) AS total_fish,
+                    COALESCE(SUM(cf.weight), 0) AS total_weight
+                FROM caught_fish cf
+                LEFT JOIN players p ON p.user_id = cf.user_id
+                {where_sql}
+                GROUP BY cf.user_id
+                ORDER BY total_weight DESC, total_fish DESC
+            '''
+            try:
+                cursor.execute(query, params)
+                rows = cursor.fetchall()
+                return [
+                    {
+                        'user_id': row[0],
+                        'username': row[1],
+                        'total_fish': row[2],
+                        'total_weight': float(row[3]),
+                    }
+                    for row in rows
+                ]
+            except Exception:
+                logger.exception('get_users_weight_leaderboard failed')
+                return []
+
     def get_level_leaderboard(self, limit: int = 10) -> List[Dict[str, Any]]:
         """Получить топ по уровню (глобально)"""
         with self._connect() as conn:
@@ -2643,8 +2584,8 @@ class Database:
                 for row in rows
             ]
 
-    def get_leaderboard_period(self, limit: int = 10, since: Optional[datetime] = None, chat_id: Optional[int] = None) -> List[Dict[str, Any]]:
-        """Получить таблицу лидеров за период и/или по чату"""
+    def get_leaderboard_period(self, limit: int = 10, since: Optional[datetime] = None, until: Optional[datetime] = None, chat_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Получить таблицу лидеров за период (с фильтром по началу и концу) и/или по чату"""
         with self._connect() as conn:
             cursor = conn.cursor()
 
@@ -2654,14 +2595,15 @@ class Database:
             # Always join players to get username
             join_clause = "LEFT JOIN players p ON p.user_id = cf.user_id"
 
-            # If chat_id provided, filter strictly by integer chat_id stored in caught_fish
-            if chat_id is not None:
-                where_clauses.append("CAST(cf.chat_id AS BIGINT) = ?")
-                params.append(int(chat_id))
+            # NOTE: Per configuration, leaderboard no longer supports filtering by chat_id.
+            # The `chat_id` parameter is accepted for compatibility but ignored.
 
             if since is not None:
                 where_clauses.append("datetime(cf.caught_at) >= datetime(?)")
                 params.append(since.strftime("%Y-%m-%d %H:%M:%S"))
+            if until is not None:
+                where_clauses.append("datetime(cf.caught_at) <= datetime(?)")
+                params.append(until.strftime("%Y-%m-%d %H:%M:%S"))
 
             where_clauses.append("cf.sold = 0")
 
@@ -2692,191 +2634,6 @@ class Database:
                     'user_id': row[1],
                     'total_fish': row[2],
                     'total_weight': row[3]
-                }
-                for row in rows
-            ]
-
-    # ===== ТУРНИРЫ =====
-
-    def create_tournament(
-        self,
-        chat_id: int,
-        created_by: int,
-        title: str,
-        tournament_type: str,
-        starts_at: datetime,
-        ends_at: datetime,
-        target_fish: Optional[str] = None,
-    ) -> int:
-        """Создать турнир и вернуть его ID."""
-        starts_str = starts_at.strftime('%Y-%m-%d %H:%M:%S')
-        ends_str = ends_at.strftime('%Y-%m-%d %H:%M:%S')
-        with self._connect() as conn:
-            cursor = conn.cursor()
-            if type(cursor).__module__.startswith('sqlite3'):
-                cursor.execute(
-                    '''
-                    INSERT INTO tournaments (chat_id, created_by, title, tournament_type, target_fish, starts_at, ends_at, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 'scheduled')
-                    ''',
-                    (int(chat_id), int(created_by), title, tournament_type, target_fish, starts_str, ends_str)
-                )
-            else:
-                cursor.execute(
-                    '''
-                    INSERT INTO tournaments (chat_id, created_by, title, tournament_type, target_fish, starts_at, ends_at, status)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, 'scheduled')
-                    RETURNING id
-                    ''',
-                    (int(chat_id), int(created_by), title, tournament_type, target_fish, starts_str, ends_str)
-                )
-            conn.commit()
-
-            if type(cursor).__module__.startswith('sqlite3'):
-                return int(cursor.lastrowid)
-            row = cursor.fetchone()
-            return int(row[0]) if row else 0
-
-    def get_tournament(self, tournament_id: int) -> Optional[Dict[str, Any]]:
-        """Получить турнир по ID."""
-        with self._connect() as conn:
-            cursor = conn.cursor()
-            if type(cursor).__module__.startswith('sqlite3'):
-                cursor.execute('SELECT * FROM tournaments WHERE id = ? LIMIT 1', (int(tournament_id),))
-            else:
-                cursor.execute('SELECT * FROM tournaments WHERE id = %s LIMIT 1', (int(tournament_id),))
-            row = cursor.fetchone()
-            if not row:
-                return None
-            cols = [d[0] for d in cursor.description]
-            return dict(zip(cols, row))
-
-    def get_active_tournament(self, chat_id: int, now_dt: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
-        """Получить активный (или ближайший scheduled) турнир для чата."""
-        now_dt = now_dt or datetime.now()
-        now_str = now_dt.strftime('%Y-%m-%d %H:%M:%S')
-        with self._connect() as conn:
-            cursor = conn.cursor()
-            if type(cursor).__module__.startswith('sqlite3'):
-                cursor.execute(
-                    '''
-                    SELECT * FROM tournaments
-                    WHERE chat_id = ?
-                      AND (
-                        (datetime(starts_at) <= datetime(?) AND datetime(ends_at) >= datetime(?))
-                        OR status = 'scheduled'
-                      )
-                    ORDER BY
-                      CASE WHEN datetime(starts_at) <= datetime(?) AND datetime(ends_at) >= datetime(?) THEN 0 ELSE 1 END,
-                      datetime(starts_at) ASC
-                    LIMIT 1
-                    ''',
-                    (int(chat_id), now_str, now_str, now_str, now_str)
-                )
-            else:
-                cursor.execute(
-                    '''
-                    SELECT * FROM tournaments
-                    WHERE chat_id = %s
-                      AND (
-                        (starts_at <= %s AND ends_at >= %s)
-                        OR status = 'scheduled'
-                      )
-                    ORDER BY
-                      CASE WHEN starts_at <= %s AND ends_at >= %s THEN 0 ELSE 1 END,
-                      starts_at ASC
-                    LIMIT 1
-                    ''',
-                    (int(chat_id), now_str, now_str, now_str, now_str)
-                )
-            row = cursor.fetchone()
-            if not row:
-                return None
-            cols = [d[0] for d in cursor.description]
-            return dict(zip(cols, row))
-
-    def get_tournament_leaderboard(self, tournament_id: int, limit: int = 10) -> List[Dict[str, Any]]:
-        """Получить лидерборд турнира по его типу."""
-        tour = self.get_tournament(tournament_id)
-        if not tour:
-            return []
-
-        tour_type = (tour.get('tournament_type') or '').strip()
-        target_fish = (tour.get('target_fish') or '').strip() or None
-        chat_id = int(tour.get('chat_id'))
-        starts_at = str(tour.get('starts_at'))
-        ends_at = str(tour.get('ends_at'))
-
-        metric_expr = 'COALESCE(SUM(cf.weight), 0)'
-        extra_filter = ''
-        extra_params: List[Any] = []
-
-        if tour_type == 'longest_fish':
-            metric_expr = 'COALESCE(MAX(cf.length), 0)'
-        elif tour_type == 'biggest_weight':
-            metric_expr = 'COALESCE(MAX(cf.weight), 0)'
-        elif tour_type == 'total_weight':
-            metric_expr = 'COALESCE(SUM(cf.weight), 0)'
-        elif tour_type == 'specific_fish':
-            metric_expr = 'COALESCE(SUM(cf.weight), 0)'
-            extra_filter = ' AND TRIM(cf.fish_name) = ? '
-            if target_fish:
-                extra_params.append(target_fish)
-            else:
-                return []
-        else:
-            return []
-
-        with self._connect() as conn:
-            cursor = conn.cursor()
-            if type(cursor).__module__.startswith('sqlite3'):
-                sql = f'''
-                    SELECT
-                        COALESCE(MAX(p.username), 'Неизвестно') AS username,
-                        cf.user_id,
-                        {metric_expr} AS metric,
-                        COUNT(cf.id) AS catches_count
-                    FROM caught_fish cf
-                    LEFT JOIN players p ON p.user_id = cf.user_id
-                    WHERE CAST(cf.chat_id AS BIGINT) = ?
-                      AND datetime(cf.caught_at) >= datetime(?)
-                      AND datetime(cf.caught_at) <= datetime(?)
-                      {extra_filter}
-                    GROUP BY cf.user_id
-                    ORDER BY metric DESC, catches_count DESC
-                    LIMIT ?
-                '''
-                params = [chat_id, starts_at, ends_at] + extra_params + [int(limit)]
-                cursor.execute(sql, params)
-            else:
-                sql = f'''
-                    SELECT
-                        COALESCE(MAX(p.username), 'Неизвестно') AS username,
-                        cf.user_id,
-                        {metric_expr} AS metric,
-                        COUNT(cf.id) AS catches_count
-                    FROM caught_fish cf
-                    LEFT JOIN players p ON p.user_id = cf.user_id
-                    WHERE CAST(cf.chat_id AS BIGINT) = %s
-                      AND cf.caught_at >= %s
-                      AND cf.caught_at <= %s
-                      {extra_filter.replace('?', '%s')}
-                    GROUP BY cf.user_id
-                    ORDER BY metric DESC, catches_count DESC
-                    LIMIT %s
-                '''
-                params = [chat_id, starts_at, ends_at] + extra_params + [int(limit)]
-                cursor.execute(sql, params)
-
-            rows = cursor.fetchall()
-            return [
-                {
-                    'username': row[0],
-                    'user_id': int(row[1]),
-                    'metric': float(row[2] or 0),
-                    'catches_count': int(row[3] or 0),
-                    'tournament_type': tour_type,
-                    'target_fish': target_fish,
                 }
                 for row in rows
             ]
@@ -2944,6 +2701,66 @@ class Database:
             rows = cursor.fetchall()
             columns = [description[0] for description in cursor.description]
             return [dict(zip(columns, row)) for row in rows]
+
+    def get_active_feeder_bonus(self, user_id: int, chat_id: int) -> int:
+        """Получить активный бонус кормушки для игрока.
+
+        Возвращает процентный бонус (целое число). Если таблиц/колонок кормушек
+        в текущей схеме нет, возвращает 0.
+        """
+        candidate_tables = [
+            'player_feeders',
+            'active_feeders',
+            'player_feeder_effects',
+            'feeders_active',
+        ]
+        bonus_columns_priority = ['bonus_percent', 'fish_bonus', 'bonus', 'effect_bonus']
+        time_columns_priority = ['expires_at', 'active_until', 'ends_at', 'end_at']
+        active_columns_priority = ['is_active', 'active', 'enabled']
+
+        with self._connect() as conn:
+            cursor = conn.cursor()
+
+            for table in candidate_tables:
+                try:
+                    cursor.execute(
+                        "SELECT column_name FROM information_schema.columns WHERE table_name = %s AND table_schema = 'public'",
+                        (table,)
+                    )
+                    columns = {row[0] for row in cursor.fetchall()}
+                    if not columns or 'user_id' not in columns:
+                        continue
+
+                    bonus_col = next((col for col in bonus_columns_priority if col in columns), None)
+                    if not bonus_col:
+                        continue
+
+                    time_col = next((col for col in time_columns_priority if col in columns), None)
+                    active_col = next((col for col in active_columns_priority if col in columns), None)
+
+                    where_parts = ["user_id = ?"]
+                    params: List[Union[int, str]] = [user_id]
+
+                    if 'chat_id' in columns:
+                        where_parts.append("(chat_id = ? OR chat_id IS NULL OR chat_id < 1)")
+                        params.append(chat_id)
+
+                    if active_col:
+                        where_parts.append(f"({active_col} = 1 OR {active_col} IS NULL)")
+
+                    if time_col:
+                        where_parts.append(f"({time_col} IS NULL OR {time_col} > CURRENT_TIMESTAMP)")
+
+                    query = f"SELECT COALESCE(MAX({bonus_col}), 0) FROM {table} WHERE " + " AND ".join(where_parts)
+                    cursor.execute(query, params)
+                    row = cursor.fetchone()
+                    value = int((row[0] if row else 0) or 0)
+                    return max(0, value)
+                except Exception:
+                    # Пробуем следующую таблицу/схему без падения игрового цикла.
+                    continue
+
+        return 0
     
     def get_bait_count(self, user_id: int, bait_name: str) -> int:
         """Получить количество наживки у игрока"""
@@ -3001,12 +2818,18 @@ class Database:
             cursor = conn.cursor()
             cursor.execute('''
                 SELECT * FROM trash 
-                WHERE locations LIKE ?
+                WHERE locations LIKE ? OR locations = 'Все'
                 ORDER BY name
             ''', (f"%{location}%",))
             rows = cursor.fetchall()
             columns = [description[0] for description in cursor.description]
-            return [dict(zip(columns, row)) for row in rows]
+            result = [dict(zip(columns, row)) for row in rows]
+            # Если нет мусора для конкретной локации — вернём весь мусор 
+            if not result:
+                cursor.execute('SELECT * FROM trash ORDER BY name')
+                rows = cursor.fetchall()
+                result = [dict(zip(columns, row)) for row in rows]
+            return result
     
     def get_random_trash(self, location: str) -> Optional[Dict[str, Any]]:
         """Получить случайный мусор для локации"""
@@ -3046,65 +2869,6 @@ class Database:
                 return False
             return bait_name.strip().lower() in suitable_list
 
-    def _upsert_ref_stars_stats(self, user_id: int, chat_id: int, received: int = 0, spent: int = 0, refunded: int = 0, withdrawn: int = 0) -> bool:
-        """Обновить агрегаты реф-звёзд для пары (user_id, chat_id)."""
-        if user_id is None or chat_id is None:
-            return False
-
-        try:
-            with self._connect() as conn:
-                cursor = conn.cursor()
-                if type(cursor).__module__.startswith('sqlite3'):
-                    cursor.execute(
-                        '''
-                        INSERT INTO ref_stars_stats (
-                            user_id, chat_id, stars_received, stars_spent, stars_refunded, stars_withdrawn, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                        ON CONFLICT(user_id, chat_id) DO UPDATE SET
-                            stars_received = COALESCE(ref_stars_stats.stars_received, 0) + excluded.stars_received,
-                            stars_spent = COALESCE(ref_stars_stats.stars_spent, 0) + excluded.stars_spent,
-                            stars_refunded = COALESCE(ref_stars_stats.stars_refunded, 0) + excluded.stars_refunded,
-                            stars_withdrawn = COALESCE(ref_stars_stats.stars_withdrawn, 0) + excluded.stars_withdrawn,
-                            updated_at = CURRENT_TIMESTAMP
-                        ''',
-                        (int(user_id), int(chat_id), int(received), int(spent), int(refunded), int(withdrawn))
-                    )
-                else:
-                    cursor.execute(
-                        '''
-                        INSERT INTO ref_stars_stats (
-                            user_id, chat_id, stars_received, stars_spent, stars_refunded, stars_withdrawn, updated_at
-                        ) VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
-                        ON CONFLICT (user_id, chat_id) DO UPDATE SET
-                            stars_received = COALESCE(ref_stars_stats.stars_received, 0) + EXCLUDED.stars_received,
-                            stars_spent = COALESCE(ref_stars_stats.stars_spent, 0) + EXCLUDED.stars_spent,
-                            stars_refunded = COALESCE(ref_stars_stats.stars_refunded, 0) + EXCLUDED.stars_refunded,
-                            stars_withdrawn = COALESCE(ref_stars_stats.stars_withdrawn, 0) + EXCLUDED.stars_withdrawn,
-                            updated_at = CURRENT_TIMESTAMP
-                        ''',
-                        (int(user_id), int(chat_id), int(received), int(spent), int(refunded), int(withdrawn))
-                    )
-                conn.commit()
-                return True
-        except Exception as e:
-            logger.error("_upsert_ref_stars_stats error: %s", e)
-            return False
-
-    def _resolve_ref_user_for_chat(self, cursor, chat_id: int) -> Optional[int]:
-        """Определить владельца/рефера для чата через chat_configs.admin_user_id."""
-        try:
-            if type(cursor).__module__.startswith('sqlite3'):
-                cursor.execute('SELECT admin_user_id FROM chat_configs WHERE chat_id = ? LIMIT 1', (chat_id,))
-            else:
-                cursor.execute('SELECT admin_user_id FROM chat_configs WHERE chat_id = %s LIMIT 1', (chat_id,))
-            row = cursor.fetchone()
-            if not row:
-                return None
-            admin_user_id = int(row[0]) if row[0] is not None else None
-            return admin_user_id if admin_user_id and admin_user_id > 0 else None
-        except Exception:
-            return None
-
     def add_star_transaction(self, user_id: int, telegram_payment_charge_id: str, total_amount: int, refund_status: str = "none", chat_id: Optional[int] = None, chat_title: Optional[str] = None) -> bool:
         """Добавить запись о транзакции Telegram Stars"""
         if not telegram_payment_charge_id:
@@ -3138,25 +2902,12 @@ class Database:
         try:
             with self._connect() as conn:
                 cursor = conn.cursor()
-                is_sqlite = type(cursor).__module__.startswith('sqlite3')
-                if is_sqlite:
-                    cursor.execute('INSERT OR IGNORE INTO chat_configs (chat_id, admin_user_id, is_configured, chat_title, stars_total) VALUES (?, ?, 1, ?, 0)', (chat_id, 0, chat_title))
-                    if chat_title is not None:
-                        cursor.execute('UPDATE chat_configs SET chat_title = ? WHERE chat_id = ?', (chat_title, chat_id))
-                    cursor.execute('UPDATE chat_configs SET stars_total = COALESCE(stars_total, 0) + ? WHERE chat_id = ?', (amount, chat_id))
-                else:
-                    cursor.execute(
-                        'INSERT INTO chat_configs (chat_id, admin_user_id, is_configured, chat_title, stars_total) VALUES (%s, %s, 1, %s, 0) ON CONFLICT (chat_id) DO NOTHING',
-                        (chat_id, 0, chat_title)
-                    )
-                    if chat_title is not None:
-                        cursor.execute('UPDATE chat_configs SET chat_title = %s WHERE chat_id = %s', (chat_title, chat_id))
-                    cursor.execute('UPDATE chat_configs SET stars_total = COALESCE(stars_total, 0) + %s WHERE chat_id = %s', (amount, chat_id))
-
-                ref_user_id = self._resolve_ref_user_for_chat(cursor, chat_id)
-                if ref_user_id:
-                    self._upsert_ref_stars_stats(ref_user_id, chat_id, received=int(amount))
-
+                # Ensure row exists
+                cursor.execute('INSERT OR IGNORE INTO chat_configs (chat_id, admin_user_id, is_configured, chat_title, stars_total) VALUES (?, ?, 1, ?, 0)', (chat_id, 0, chat_title))
+                # Update title if provided
+                if chat_title is not None:
+                    cursor.execute('UPDATE chat_configs SET chat_title = ? WHERE chat_id = ?', (chat_title, chat_id))
+                cursor.execute('UPDATE chat_configs SET stars_total = COALESCE(stars_total, 0) + ? WHERE chat_id = ?', (amount, chat_id))
                 conn.commit()
                 return True
         except Exception as e:
@@ -3164,18 +2915,40 @@ class Database:
             return False
 
     def get_all_chat_stars(self) -> List[Dict[str, Any]]:
-        """Return list of group/channel chats with title and total stars."""
+        """Return list of chats with their title and total stars, sourced from star_transactions."""
         with self._connect() as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                'SELECT chat_id, COALESCE(chat_title, "") as chat_title, COALESCE(stars_total,0) as stars_total '
-                'FROM chat_configs '
-                'WHERE chat_id < 0 '
-                'ORDER BY stars_total DESC'
-            )
+            cursor.execute('''
+                SELECT
+                    s.chat_id,
+                    COALESCE(c.chat_title, '') AS chat_title,
+                    COALESCE(s.stars_total, 0) AS stars_total,
+                    COALESCE(s.occurrences, 0) AS occurrences
+                FROM (
+                    SELECT chat_id,
+                           SUM(total_amount) AS stars_total,
+                           COUNT(*) AS occurrences
+                    FROM star_transactions
+                    WHERE chat_id IS NOT NULL
+                      AND COALESCE(refund_status, 'none') = 'none'
+                    GROUP BY chat_id
+                ) s
+                LEFT JOIN chat_configs c ON c.chat_id = s.chat_id
+                ORDER BY s.stars_total DESC NULLS LAST
+            ''')
             rows = cursor.fetchall()
             cols = [d[0] for d in cursor.description]
             return [dict(zip(cols, r)) for r in rows]
+
+    def get_chat_occurrences(self, chat_id: int) -> int:
+        """Return number of star_transactions rows for a given chat_id."""
+        if chat_id is None:
+            return 0
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT COUNT(*) FROM star_transactions WHERE chat_id = ?', (chat_id,))
+            row = cursor.fetchone()
+            return int(row[0]) if row else 0
 
     def update_chat_title(self, chat_id: int, chat_title: str) -> bool:
         """Update chat title in chat_configs."""
@@ -3209,45 +2982,11 @@ class Database:
             return False
         with self._connect() as conn:
             cursor = conn.cursor()
-            is_sqlite = type(cursor).__module__.startswith('sqlite3')
-            if is_sqlite:
-                cursor.execute(
-                    'SELECT user_id, chat_id, total_amount, refund_status FROM star_transactions WHERE telegram_payment_charge_id = ? LIMIT 1',
-                    (telegram_payment_charge_id,)
-                )
-            else:
-                cursor.execute(
-                    'SELECT user_id, chat_id, total_amount, refund_status FROM star_transactions WHERE telegram_payment_charge_id = %s LIMIT 1',
-                    (telegram_payment_charge_id,)
-                )
-            prev = cursor.fetchone()
-
-            if is_sqlite:
-                cursor.execute('''
-                    UPDATE star_transactions
-                    SET refund_status = ?
-                    WHERE telegram_payment_charge_id = ?
-                ''', (refund_status, telegram_payment_charge_id))
-            else:
-                cursor.execute('''
-                    UPDATE star_transactions
-                    SET refund_status = %s
-                    WHERE telegram_payment_charge_id = %s
-                ''', (refund_status, telegram_payment_charge_id))
-
-            if cursor.rowcount > 0 and prev:
-                tx_user_id, tx_chat_id, tx_amount, prev_status = prev
-                new_status = (refund_status or '').strip().lower()
-                old_status = (prev_status or '').strip().lower()
-                if tx_chat_id is not None and new_status in {'ref', 'refunded'} and old_status not in {'ref', 'refunded'}:
-                    ref_user_id = self._resolve_ref_user_for_chat(cursor, int(tx_chat_id)) or tx_user_id
-                    if ref_user_id:
-                        self._upsert_ref_stars_stats(
-                            int(ref_user_id),
-                            int(tx_chat_id),
-                            spent=int(tx_amount or 0),
-                            refunded=int(tx_amount or 0)
-                        )
+            cursor.execute('''
+                UPDATE star_transactions
+                SET refund_status = ?
+                WHERE telegram_payment_charge_id = ?
+            ''', (refund_status, telegram_payment_charge_id))
             conn.commit()
             return cursor.rowcount > 0
     
@@ -3441,16 +3180,10 @@ class Database:
             cursor = conn.cursor()
             
             # Проверяем, существует ли запись для этой удочки
-            if type(cursor).__module__.startswith('sqlite3'):
-                cursor.execute('''
-                    SELECT current_durability FROM player_rods 
-                    WHERE user_id = ? AND (chat_id IS NULL OR chat_id < 1) AND rod_name = ?
-                ''', (user_id, rod_name))
-            else:
-                cursor.execute('''
-                    SELECT current_durability FROM player_rods 
-                    WHERE user_id = %s AND (chat_id IS NULL OR chat_id < 1) AND rod_name = %s
-                ''', (user_id, rod_name))
+            cursor.execute('''
+                SELECT current_durability FROM player_rods 
+                WHERE user_id = %s AND (chat_id IS NULL OR chat_id < 1) AND rod_name = %s
+            ''', (user_id, rod_name))
             
             result = cursor.fetchone()
             if not result:
@@ -3458,18 +3191,11 @@ class Database:
                 self.init_player_rod(user_id, rod_name, chat_id=chat_id)
             
             # Уменьшаем прочность
-            if type(cursor).__module__.startswith('sqlite3'):
-                cursor.execute('''
-                    UPDATE player_rods 
-                    SET current_durability = MAX(0, current_durability - ?)
-                    WHERE user_id = ? AND (chat_id IS NULL OR chat_id < 1) AND rod_name = ?
-                ''', (damage, user_id, rod_name))
-            else:
-                cursor.execute('''
-                    UPDATE player_rods 
-                    SET current_durability = GREATEST(0, current_durability - %s)
-                    WHERE user_id = %s AND (chat_id IS NULL OR chat_id < 1) AND rod_name = %s
-                ''', (damage, user_id, rod_name))
+            cursor.execute('''
+                UPDATE player_rods 
+                SET current_durability = GREATEST(0, current_durability - %s)
+                WHERE user_id = %s AND (chat_id IS NULL OR chat_id < 1) AND rod_name = %s
+            ''', (damage, user_id, rod_name))
             conn.commit()
             
             # Запускаем процесс восстановления, если еще не запущен
@@ -3496,18 +3222,11 @@ class Database:
             return
         with self._connect() as conn:
             cursor = conn.cursor()
-            if type(cursor).__module__.startswith('sqlite3'):
-                cursor.execute('''
-                    UPDATE player_rods 
-                    SET recovery_start_time = CURRENT_TIMESTAMP
-                    WHERE user_id = ? AND (chat_id IS NULL OR chat_id < 1) AND rod_name = ?
-                ''', (user_id, rod_name))
-            else:
-                cursor.execute('''
-                    UPDATE player_rods 
-                    SET recovery_start_time = CURRENT_TIMESTAMP
-                    WHERE user_id = %s AND (chat_id IS NULL OR chat_id < 1) AND rod_name = %s
-                ''', (user_id, rod_name))
+            cursor.execute('''
+                UPDATE player_rods 
+                SET recovery_start_time = CURRENT_TIMESTAMP
+                WHERE user_id = %s AND (chat_id IS NULL OR chat_id < 1) AND rod_name = %s
+            ''', (user_id, rod_name))
             conn.commit()
 
     def recover_rod_durability(self, user_id: int, rod_name: str, recovery_amount: int, chat_id: int):
@@ -3664,16 +3383,33 @@ class Database:
                 WHERE user_id = ? AND (chat_id IS NULL OR chat_id < 1) AND rod_name = ?
             ''', (user_id, rod_name))
             if cursor.fetchone():
+                # If this is a temporary rod (uses range), initialize uses accordingly
+                uses = self._get_temp_rod_uses(rod_name)
+                if uses is None:
+                    max_dur = rod.get('max_durability', rod.get('durability', 0))
+                    current = max_dur
+                else:
+                    max_dur = uses
+                    current = uses
+
                 cursor.execute('''
                     UPDATE player_rods
                     SET current_durability = ?, max_durability = ?
                     WHERE user_id = ? AND (chat_id IS NULL OR chat_id < 1) AND rod_name = ?
-                ''', (rod.get('max_durability', rod.get('durability', 0)), rod.get('max_durability', rod.get('durability', 0)), user_id, rod_name))
+                ''', (current, max_dur, user_id, rod_name))
             else:
+                uses = self._get_temp_rod_uses(rod_name)
+                if uses is None:
+                    max_dur = rod.get('max_durability', rod.get('durability', 0))
+                    current = max_dur
+                else:
+                    max_dur = uses
+                    current = uses
+
                 cursor.execute('''
                     INSERT OR REPLACE INTO player_rods (user_id, rod_name, current_durability, max_durability, chat_id)
                     VALUES (?, ?, ?, ?, -1)
-                ''', (user_id, rod_name, rod.get('max_durability', rod.get('durability', 0)), rod.get('max_durability', rod.get('durability', 0))))
+                ''', (user_id, rod_name, current, max_dur))
             conn.commit()
             return True
     
@@ -3787,174 +3523,22 @@ class Database:
 
         remaining = (cooldown_end - now).total_seconds()
         return int(remaining)
-    
+
+    def reset_net_cooldowns(self, user_id: int) -> None:
+        """Сбросить кулдаун всех сетей игрока (обнулить время последнего использования)"""
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'UPDATE players SET last_net_use_time = NULL WHERE user_id = %s',
+                (user_id,)
+            )
+            cursor.execute(
+                'UPDATE player_nets SET last_use_time = NULL WHERE user_id = %s',
+                (user_id,)
+            )
+            conn.commit()
+
     # ===== РЕФЕРАЛЬНАЯ СИСТЕМА =====
-
-    def add_ref_access(self, user_id: int, chat_id: int) -> bool:
-        """Выдать пользователю доступ к реферальной статистике чата."""
-        with self._connect() as conn:
-            cursor = conn.cursor()
-            if type(cursor).__module__.startswith('sqlite3'):
-                cursor.execute(
-                    'INSERT OR IGNORE INTO chat_configs (chat_id, admin_user_id, is_configured) VALUES (?, ?, 1)',
-                    (chat_id, user_id)
-                )
-            else:
-                cursor.execute(
-                    'INSERT INTO chat_configs (chat_id, admin_user_id, is_configured) VALUES (%s, %s, 1) ON CONFLICT (chat_id) DO UPDATE SET admin_user_id = EXCLUDED.admin_user_id, is_configured = 1',
-                    (chat_id, user_id)
-                )
-            self._upsert_ref_stars_stats(user_id, chat_id)
-            conn.commit()
-            return True
-
-    def get_ref_stars_stats(self, user_id: int, chat_id: int) -> Dict[str, int]:
-        """Получить агрегированную статистику по реф-звёздам для пары user/chat."""
-        with self._connect() as conn:
-            cursor = conn.cursor()
-            if type(cursor).__module__.startswith('sqlite3'):
-                cursor.execute(
-                    '''
-                    SELECT
-                        COALESCE(stars_received, 0),
-                        COALESCE(stars_spent, 0),
-                        COALESCE(stars_refunded, 0),
-                        COALESCE(stars_withdrawn, 0)
-                    FROM ref_stars_stats
-                    WHERE user_id = ? AND chat_id = ?
-                    ''',
-                    (user_id, chat_id)
-                )
-            else:
-                cursor.execute(
-                    '''
-                    SELECT
-                        COALESCE(stars_received, 0),
-                        COALESCE(stars_spent, 0),
-                        COALESCE(stars_refunded, 0),
-                        COALESCE(stars_withdrawn, 0)
-                    FROM ref_stars_stats
-                    WHERE user_id = %s AND chat_id = %s
-                    ''',
-                    (user_id, chat_id)
-                )
-            row = cursor.fetchone()
-            if not row:
-                return {
-                    'stars_received': 0,
-                    'stars_spent': 0,
-                    'stars_refunded': 0,
-                    'stars_withdrawn': 0,
-                    'stars_available': 0,
-                }
-
-            received = int(row[0] or 0)
-            spent = int(row[1] or 0)
-            refunded = int(row[2] or 0)
-            withdrawn = int(row[3] or 0)
-            available = max(0, received - spent)
-            return {
-                'stars_received': received,
-                'stars_spent': spent,
-                'stars_refunded': refunded,
-                'stars_withdrawn': withdrawn,
-                'stars_available': available,
-            }
-
-    def get_ref_access_chats(self, user_id: int) -> List[int]:
-        """Список chat_id, где пользователь имеет доступ к реферальной статистике."""
-        with self._connect() as conn:
-            cursor = conn.cursor()
-            if type(cursor).__module__.startswith('sqlite3'):
-                cursor.execute(
-                    'SELECT chat_id FROM chat_configs WHERE admin_user_id = ? AND is_configured = 1',
-                    (user_id,)
-                )
-            else:
-                cursor.execute(
-                    'SELECT chat_id FROM chat_configs WHERE admin_user_id = %s AND is_configured = 1',
-                    (user_id,)
-                )
-            rows = cursor.fetchall()
-            return [int(row[0]) for row in rows] if rows else []
-
-    def get_chat_title(self, chat_id: int) -> Optional[str]:
-        """Название чата из chat_configs."""
-        with self._connect() as conn:
-            cursor = conn.cursor()
-            if type(cursor).__module__.startswith('sqlite3'):
-                cursor.execute('SELECT chat_title FROM chat_configs WHERE chat_id = ?', (chat_id,))
-            else:
-                cursor.execute('SELECT chat_title FROM chat_configs WHERE chat_id = %s', (chat_id,))
-            row = cursor.fetchone()
-            return row[0] if row and row[0] else None
-
-    def get_chat_stars_total(self, chat_id: int) -> int:
-        """Общее количество звёзд, пришедших от чата."""
-        with self._connect() as conn:
-            cursor = conn.cursor()
-            if type(cursor).__module__.startswith('sqlite3'):
-                cursor.execute('SELECT COALESCE(stars_total, 0) FROM chat_configs WHERE chat_id = ?', (chat_id,))
-            else:
-                cursor.execute('SELECT COALESCE(stars_total, 0) FROM chat_configs WHERE chat_id = %s', (chat_id,))
-            row = cursor.fetchone()
-            return int(row[0]) if row else 0
-
-    def get_chat_refunds_total(self, chat_id: int) -> int:
-        """Сумма refund/withdraw для чата по транзакциям."""
-        with self._connect() as conn:
-            cursor = conn.cursor()
-            if type(cursor).__module__.startswith('sqlite3'):
-                cursor.execute(
-                    "SELECT COALESCE(SUM(total_amount), 0) FROM star_transactions WHERE chat_id = ? AND refund_status IN ('approved', 'refunded', 'ref')",
-                    (chat_id,)
-                )
-            else:
-                cursor.execute(
-                    "SELECT COALESCE(SUM(total_amount), 0) FROM star_transactions WHERE chat_id = %s AND refund_status IN ('approved', 'refunded', 'ref')",
-                    (chat_id,)
-                )
-            row = cursor.fetchone()
-            return int(row[0]) if row else 0
-
-    def get_available_stars_for_withdraw(self, user_id: int, chat_id: int) -> int:
-        """Доступные к выводу звезды для чата (совместимый интерфейс с bot.py)."""
-        _ = user_id
-        total = self.get_chat_stars_total(chat_id)
-        refunded = self.get_chat_refunds_total(chat_id)
-        return max(0, total - refunded)
-
-    def get_withdrawn_stars(self, user_id: int, chat_id: int) -> int:
-        """Уже выведенные звезды для чата (совместимый интерфейс с bot.py)."""
-        _ = user_id
-        return self.get_chat_refunds_total(chat_id)
-
-    def mark_stars_withdrawn(self, user_id: int, amount: int, chat_id: Optional[int] = None, status: str = 'approved') -> bool:
-        """Записать факт вывода звёзд в транзакции."""
-        with self._connect() as conn:
-            cursor = conn.cursor()
-            title = self.get_chat_title(chat_id) if chat_id is not None else None
-            if type(cursor).__module__.startswith('sqlite3'):
-                cursor.execute(
-                    "INSERT INTO star_transactions (user_id, telegram_payment_charge_id, total_amount, chat_id, chat_title, refund_status) VALUES (?, ?, ?, ?, ?, ?)",
-                    (user_id, f"withdraw_{user_id}_{int(datetime.now().timestamp())}", int(amount), chat_id, title, status)
-                )
-            else:
-                cursor.execute(
-                    "INSERT INTO star_transactions (user_id, telegram_payment_charge_id, total_amount, chat_id, chat_title, refund_status) VALUES (%s, %s, %s, %s, %s, %s)",
-                    (user_id, f"withdraw_{user_id}_{int(datetime.now().timestamp())}", int(amount), chat_id, title, status)
-                )
-
-            if chat_id is not None:
-                self._upsert_ref_stars_stats(
-                    int(user_id),
-                    int(chat_id),
-                    spent=int(amount),
-                    withdrawn=int(amount)
-                )
-
-            conn.commit()
-            return True
     
     def set_player_ref(self, user_id: int, chat_id: int, ref_user_id: int) -> bool:
         """Установить реферера для пользователя"""
@@ -4096,21 +3680,152 @@ class Database:
         """Получить все чаты, зарегистрированные этим юзером"""
         with self._connect() as conn:
             cursor = conn.cursor()
-            if type(cursor).__module__.startswith('sqlite3'):
-                cursor.execute('''
-                    SELECT chat_id, admin_ref_link, chat_invite_link
-                    FROM chat_configs
-                    WHERE admin_user_id = ? AND is_configured = 1
-                ''', (user_id,))
-            else:
-                cursor.execute('''
-                    SELECT chat_id, admin_ref_link, chat_invite_link
-                    FROM chat_configs
-                    WHERE admin_user_id = %s AND is_configured = 1
-                ''', (user_id,))
+            cursor.execute('''
+                SELECT chat_id, admin_ref_link, chat_invite_link
+                FROM chat_configs 
+                WHERE admin_user_id = %s AND is_configured = 1
+            ''', (user_id,))
             rows = cursor.fetchall()
             cols = [d[0] for d in cursor.description] if cursor.description else []
             return [dict(zip(cols, row)) for row in rows]
+
+    def update_population_state(self, user_id: int, current_location: str) -> tuple:
+        """
+        Обновить состояние популяции рыб на локации.
+        Отслеживает, сколько раз подряд игрок ловит на одной локации.
+        Возвращает (location_changed, consecutive_casts, show_warning)
+        """
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            
+            # Получаем текущее состояние игрока
+            cursor.execute('''
+                SELECT consecutive_casts_at_location, last_fishing_location, population_penalty
+                FROM players
+                WHERE user_id = %s AND chat_id = -1
+            ''', (user_id,))
+            row = cursor.fetchone()
+            
+            if not row:
+                # Новый игрок
+                location_changed = True
+                consecutive_casts = 1
+                population_penalty = 0.0
+            else:
+                last_casts, last_location, population_penalty = row
+                last_casts = last_casts or 0
+                population_penalty = population_penalty or 0.0
+                
+                # Проверяем, изменилась ли локация
+                location_changed = (last_location != current_location)
+                
+                if location_changed:
+                    # Игрок переместился на новую локацию
+                    consecutive_casts = 1
+                    population_penalty = 0.0  # Штраф сбрасывается при смене локации
+                else:
+                    # Остался на той же локации
+                    consecutive_casts = last_casts + 1
+                    
+                    # Рассчитываем штраф на основе количества забросов
+                    if consecutive_casts >= 60:
+                        population_penalty = 15.0
+                    elif consecutive_casts >= 50:
+                        population_penalty = 11.0
+                    elif consecutive_casts >= 40:
+                        population_penalty = 8.0
+                    elif consecutive_casts >= 30:
+                        population_penalty = 5.0
+                    else:
+                        population_penalty = 0.0
+            
+            # Обновляем состояние в базе
+            cursor.execute('''
+                UPDATE players
+                SET consecutive_casts_at_location = %s,
+                    last_fishing_location = %s,
+                    population_penalty = %s
+                WHERE user_id = %s AND chat_id = -1
+            ''', (consecutive_casts, current_location, population_penalty, user_id))
+            conn.commit()
+            
+            # show_warning если достигли 30 забросов
+            show_warning = (consecutive_casts == 30 and not location_changed)
+            
+            return (location_changed, consecutive_casts, show_warning)
+    
+    def get_consecutive_casts(self, user_id: int) -> int:
+        """Получить количество консекутивных забросов на текущей локации"""
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT consecutive_casts_at_location
+                FROM players
+                WHERE user_id = %s AND chat_id = -1
+            ''', (user_id,))
+            row = cursor.fetchone()
+            return row[0] if (row and row[0]) else 0
+    
+    def get_population_penalty(self, user_id: int) -> float:
+        """Получить текущий штраф на популяцию рыб для игрока"""
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT population_penalty
+                FROM players
+                WHERE user_id = %s AND chat_id = -1
+            ''', (user_id,))
+            row = cursor.fetchone()
+            return row[0] if (row and row[0]) else 0.0
+
+    def add_treasure(self, user_id: int, treasure_name: str, quantity: int = 1, chat_id: int = -1):
+        """Добавить сокровище игроку"""
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute('''
+                    INSERT INTO player_treasures (user_id, chat_id, treasure_name, quantity)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (user_id, chat_id, treasure_name) DO UPDATE
+                    SET quantity = quantity + %s
+                ''', (user_id, chat_id, treasure_name, quantity, quantity))
+                conn.commit()
+            except Exception as e:
+                logger.error(f"Error adding treasure: {e}")
+                conn.rollback()
+
+    def get_player_treasures(self, user_id: int, chat_id: int) -> List[Dict[str, Any]]:
+        """Получить все сокровища игрока"""
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute('''
+                    SELECT treasure_name, quantity, obtained_at
+                    FROM player_treasures
+                    WHERE user_id = %s AND chat_id = %s AND quantity > 0
+                    ORDER BY obtained_at DESC
+                ''', (user_id, chat_id))
+                rows = cursor.fetchall()
+                cols = [d[0] for d in cursor.description] if cursor.description else []
+                return [dict(zip(cols, row)) for row in rows]
+            except Exception as e:
+                logger.error(f"Error getting player treasures: {e}")
+                return []
+
+    def remove_treasure(self, user_id: int, chat_id: int, treasure_name: str, quantity: int = 1):
+        """Удалить сокровище у игрока"""
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute('''
+                    UPDATE player_treasures
+                    SET quantity = quantity - %s
+                    WHERE user_id = %s AND chat_id = %s AND treasure_name = %s
+                ''', (quantity, user_id, chat_id, treasure_name))
+                conn.commit()
+            except Exception as e:
+                logger.error(f"Error removing treasure: {e}")
+                conn.rollback()
 
 
 # Экземпляр базы данных для импорта в других модулях
