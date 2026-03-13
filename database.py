@@ -2876,17 +2876,26 @@ class Database:
         self._ensure_booster_tables()
         with self._connect() as conn:
             cursor = conn.cursor()
+            expires_expr_minutes = int(duration_minutes)
             cursor.execute(
                 '''
-                INSERT INTO player_feeders (user_id, chat_id, feeder_type, bonus_percent, expires_at)
-                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP + (? || ' minutes')::interval)
-                ON CONFLICT (user_id, chat_id) DO UPDATE SET
-                    feeder_type = EXCLUDED.feeder_type,
-                    bonus_percent = EXCLUDED.bonus_percent,
-                    expires_at = EXCLUDED.expires_at
+                UPDATE player_feeders
+                SET feeder_type = ?,
+                    bonus_percent = ?,
+                    expires_at = CURRENT_TIMESTAMP + (? || ' minutes')::interval
+                WHERE user_id = ? AND chat_id = ?
                 ''',
-                (user_id, chat_id, feeder_type, int(bonus_percent), int(duration_minutes)),
+                (feeder_type, int(bonus_percent), expires_expr_minutes, user_id, chat_id),
             )
+
+            if cursor.rowcount == 0:
+                cursor.execute(
+                    '''
+                    INSERT INTO player_feeders (user_id, chat_id, feeder_type, bonus_percent, expires_at)
+                    VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP + (? || ' minutes')::interval)
+                    ''',
+                    (user_id, chat_id, feeder_type, int(bonus_percent), expires_expr_minutes),
+                )
             conn.commit()
 
     def get_echosounder_remaining_seconds(self, user_id: int, chat_id: int) -> int:
@@ -2920,15 +2929,24 @@ class Database:
         self._ensure_booster_tables()
         with self._connect() as conn:
             cursor = conn.cursor()
+            hours = int(duration_hours)
             cursor.execute(
                 '''
-                INSERT INTO player_echosounder (user_id, chat_id, expires_at)
-                VALUES (?, 0, CURRENT_TIMESTAMP + (? || ' hours')::interval)
-                ON CONFLICT (user_id, chat_id) DO UPDATE SET
-                    expires_at = EXCLUDED.expires_at
+                UPDATE player_echosounder
+                SET expires_at = CURRENT_TIMESTAMP + (? || ' hours')::interval
+                WHERE user_id = ? AND chat_id = 0
                 ''',
-                (user_id, int(duration_hours)),
+                (hours, user_id),
             )
+
+            if cursor.rowcount == 0:
+                cursor.execute(
+                    '''
+                    INSERT INTO player_echosounder (user_id, chat_id, expires_at)
+                    VALUES (?, 0, CURRENT_TIMESTAMP + (? || ' hours')::interval)
+                    ''',
+                    (user_id, hours),
+                )
             conn.commit()
     
     def get_bait_count(self, user_id: int, bait_name: str) -> int:
