@@ -111,7 +111,7 @@ FISH_EMOJI_TAGS = [
 STAR_EMOJI_TAG = '<tg-emoji emoji-id="5463289097336405244">⭐</tg-emoji>'
 LOCATION_EMOJI_TAG = '<tg-emoji emoji-id="5821128296217185461">📍</tg-emoji>'
 PARTY_EMOJI_TAG = '<tg-emoji emoji-id="5436040291507247633">🎉</tg-emoji>'
-DIAMOND_EMOJI_TAG = '<tg-emoji emoji-id="5427168083074628963">💎</tg-emoji>'
+DIAMOND_EMOJI_TAG = '<tg-emoji emoji-id="5366124516055487969">💎</tg-emoji>'
 TG_EMOJI_TAG_RE = re.compile(r'<tg-emoji\s+emoji-id="[^"]+">(.*?)</tg-emoji>')
 
 # Booster catalog used by the feeders/echosounder shop.
@@ -143,7 +143,7 @@ FEEDER_ITEMS = [
 ]
 
 ECHOSOUNDER_CODE = "echosounder"
-ECHOSOUNDER_COST_STARS = 10
+ECHOSOUNDER_COST_STARS = 20
 ECHOSOUNDER_DURATION_HOURS = 24
 
 def _replace_plain_emoji_segment(text: str) -> str:
