@@ -2650,6 +2650,38 @@ class Database:
             rows = cursor.fetchall()
             columns = [description[0] for description in cursor.description]
             return [dict(zip(columns, row)) for row in rows]
+
+    def ensure_rod_catalog(self):
+        """Гарантировать наличие базового каталога удочек и корректного max_weight."""
+        rods_data = [
+            ("Бамбуковая удочка", 0, 100, 100, 0, 30),
+            ("Углепластиковая удочка", 1500, 150, 150, 5, 60),
+            ("Карбоновая удочка", 4500, 200, 200, 10, 120),
+            ("Золотая удочка", 15000, 300, 300, 20, 350),
+            ("Удачливая удочка", 25000, 150, 150, 15, 650),
+        ]
+        rods_weight_updates = [
+            (30, "Бамбуковая удочка"),
+            (60, "Углепластиковая удочка"),
+            (120, "Карбоновая удочка"),
+            (350, "Золотая удочка"),
+            (650, "Удачливая удочка"),
+        ]
+
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.executemany(
+                '''
+                INSERT OR IGNORE INTO rods (name, price, durability, max_durability, fish_bonus, max_weight)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ''',
+                rods_data,
+            )
+
+            for max_w, rod_name in rods_weight_updates:
+                cursor.execute('UPDATE rods SET max_weight = ? WHERE name = ?', (max_w, rod_name))
+
+            conn.commit()
     
     def get_locations(self) -> List[Dict[str, Any]]:
         """Получить список всех локаций"""
