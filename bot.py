@@ -1943,19 +1943,14 @@ class FishBot:
             durability_line = f"🔧 Прочность: {player_rod['current_durability']}/{player_rod['max_durability']}\n"
 
         diamond_count = player.get('diamonds', 0)
-        coin_emoji = COIN_EMOJI_TAG
-        diamond_emoji = DIAMOND_EMOJI_TAG
-        rod_emoji = FISHING_EMOJI_TAG
-        location_emoji = LOCATION_EMOJI_TAG
-        bait_emoji = WORM_EMOJI_TAG
         menu_text = f"""
-{rod_emoji} Меню рыбалки
+🎣 Меню рыбалки
 
-{coin_emoji} Монеты: {html.escape(str(player['coins']))} {html.escape(COIN_NAME)}
-{diamond_emoji} Бриллианты: {html.escape(str(diamond_count))}
-{rod_emoji} Удочка: {html.escape(str(player['current_rod']))}
-{location_emoji} Локация: {html.escape(str(player['current_location']))}
-{bait_emoji} Наживка: {html.escape(str(player['current_bait']))}
+🪙 Монеты: {html.escape(str(player['coins']))} {html.escape(COIN_NAME)}
+💎 Бриллианты: {html.escape(str(diamond_count))}
+🎣 Удочка: {html.escape(str(player['current_rod']))}
+📍 Локация: {html.escape(str(player['current_location']))}
+🪱 Наживка: {html.escape(str(player['current_bait']))}
 {durability_line}
         """
 
@@ -2361,7 +2356,7 @@ class FishBot:
 
         keyboard = [[
             InlineKeyboardButton("🔙 Назад", callback_data=f"back_to_menu_{user_id}"),
-            InlineKeyboardButton(f"{LOCATION_EMOJI_TAG} Сменить локацию", callback_data=f"change_location_{user_id}")
+            InlineKeyboardButton("📍 Сменить локацию", callback_data=f"change_location_{user_id}")
         ]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(
