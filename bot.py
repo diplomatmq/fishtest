@@ -114,7 +114,7 @@ PARTY_EMOJI_TAG = '<tg-emoji emoji-id="5436040291507247633">🎉</tg-emoji>'
 DIAMOND_EMOJI_TAG = '<tg-emoji emoji-id="5347855243556129844">💎</tg-emoji>'
 TG_EMOJI_TAG_RE = re.compile(r'<tg-emoji\s+emoji-id="[^"]+">(.*?)</tg-emoji>')
 
-def replace_coin_emoji(text: str) -> str:
+def _replace_plain_emoji_segment(text: str) -> str:
     if not text:
         return text
     return (
@@ -134,6 +134,23 @@ def replace_coin_emoji(text: str) -> str:
         .replace("💎", DIAMOND_EMOJI_TAG)
         .replace("💍", DIAMOND_EMOJI_TAG)
     )
+
+
+def replace_coin_emoji(text: str) -> str:
+    if not text:
+        return text
+    if '<tg-emoji' not in text:
+        return _replace_plain_emoji_segment(text)
+
+    # Preserve existing <tg-emoji> tags and only replace plain emoji outside them.
+    result_parts = []
+    last_pos = 0
+    for match in TG_EMOJI_TAG_RE.finditer(text):
+        result_parts.append(_replace_plain_emoji_segment(text[last_pos:match.start()]))
+        result_parts.append(match.group(0))
+        last_pos = match.end()
+    result_parts.append(_replace_plain_emoji_segment(text[last_pos:]))
+    return ''.join(result_parts)
 
 def strip_tg_emoji_tags(text: str) -> str:
     if not text or '<tg-emoji' not in text:
@@ -1992,14 +2009,14 @@ class FishBot:
 
         diamond_count = player.get('diamonds', 0)
         menu_text = f"""
-🎣 Меню рыбалки
+    {FISHING_EMOJI_TAG} Меню рыбалки
 
-🪙 Монеты: {html.escape(str(player['coins']))} {html.escape(COIN_NAME)}
-💎 Бриллианты: {html.escape(str(diamond_count))}
-🎣 Удочка: {html.escape(str(player['current_rod']))}
-📍 Локация: {html.escape(str(player['current_location']))}
-🪱 Наживка: {html.escape(str(player['current_bait']))}
-{durability_line}
+    {COIN_EMOJI_TAG} Монеты: {html.escape(str(player['coins']))} {html.escape(COIN_NAME)}
+    {DIAMOND_EMOJI_TAG} Бриллианты: {html.escape(str(diamond_count))}
+    {FISHING_EMOJI_TAG} Удочка: {html.escape(str(player['current_rod']))}
+    {LOCATION_EMOJI_TAG} Локация: {html.escape(str(player['current_location']))}
+    {WORM_EMOJI_TAG} Наживка: {html.escape(str(player['current_bait']))}
+    {durability_line}
         """
 
         keyboard = [
