@@ -111,7 +111,7 @@ FISH_EMOJI_TAGS = [
 STAR_EMOJI_TAG = '<tg-emoji emoji-id="5463289097336405244">⭐</tg-emoji>'
 LOCATION_EMOJI_TAG = '<tg-emoji emoji-id="5821128296217185461">📍</tg-emoji>'
 PARTY_EMOJI_TAG = '<tg-emoji emoji-id="5436040291507247633">🎉</tg-emoji>'
-DIAMOND_EMOJI_TAG = '<tg-emoji emoji-id="5347855243556129844">💎</tg-emoji>'
+DIAMOND_EMOJI_TAG = '<tg-emoji emoji-id="5427168083074628963">💎</tg-emoji>'
 TG_EMOJI_TAG_RE = re.compile(r'<tg-emoji\s+emoji-id="[^"]+">(.*?)</tg-emoji>')
 
 def _replace_plain_emoji_segment(text: str) -> str:
@@ -132,7 +132,6 @@ def _replace_plain_emoji_segment(text: str) -> str:
         .replace("📍", LOCATION_EMOJI_TAG)
         .replace("🎉", PARTY_EMOJI_TAG)
         .replace("💎", DIAMOND_EMOJI_TAG)
-        .replace("💍", DIAMOND_EMOJI_TAG)
     )
 
 
@@ -3773,8 +3772,9 @@ class FishBot:
         keyboard = [
             [InlineKeyboardButton("🎣 Удочки", callback_data=f"shop_rods_{user_id}")],
             [InlineKeyboardButton("🪱 Наживки", callback_data=f"shop_baits_{user_id}")],
-            [InlineKeyboardButton("�️ Сети", callback_data=f"shop_nets_{user_id}")],
-            [InlineKeyboardButton("�🔙 Назад", callback_data=f"back_to_menu_{user_id}")]
+            [InlineKeyboardButton("🕸️ Сети", callback_data=f"shop_nets_{user_id}")],
+            [InlineKeyboardButton("🧺 Кормушки и эхолот", callback_data=f"shop_feeders_{user_id}")],
+            [InlineKeyboardButton("🔙 Назад", callback_data=f"back_to_menu_{user_id}")]
         ]
         
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -3927,7 +3927,7 @@ class FishBot:
 💎 Обменник драгоценностей
 
 💰 Ваш баланс: {coins} 🪙
-💍 Бриллианты: {diamonds}
+💎 Бриллианты: {diamonds}
 
 📊 Курсы обмена:
 💎 1 Бриллиант = 500,000 монет (покупка)
@@ -3977,9 +3977,9 @@ class FishBot:
         await query.edit_message_text(
             f"✅ Успешная покупка!\n\n"
             f"Потрачено: {DIAMOND_BUY_PRICE:,} 🪙\n"
-            f"Получено: 1 💍\n\n"
+            f"Получено: 1 💎\n\n"
             f"💰 Новый баланс: {new_coins:,} 🪙\n"
-            f"💍 Бриллианты: {new_diamonds}"
+            f"💎 Бриллианты: {new_diamonds}"
         )
 
     async def handle_exchange_sell_diamond(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4016,9 +4016,9 @@ class FishBot:
         await query.edit_message_text(
             f"✅ Успешно продано!\n\n"
             f"Получено: {DIAMOND_SELL_PRICE:,} 🪙\n"
-            f"Продано: 1 💍\n\n"
+            f"Продано: 1 💎\n\n"
             f"💰 Новый баланс: {new_coins:,} 🪙\n"
-            f"💍 Бриллианты: {new_diamonds}"
+            f"💎 Бриллианты: {new_diamonds}"
         )
     
     async def handle_sell_fish(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7004,6 +7004,7 @@ def main():
     application.add_handler(CallbackQueryHandler(bot_instance.handle_shop_baits_location, pattern="^shop_baits_loc_"))
     application.add_handler(CallbackQueryHandler(bot_instance.handle_shop_baits, pattern="^shop_baits_"))
     application.add_handler(CallbackQueryHandler(bot_instance.handle_shop_nets, pattern="^shop_nets_"))
+    application.add_handler(CallbackQueryHandler(bot_instance.handle_shop_feeders, pattern="^shop_feeders_"))
     application.add_handler(CallbackQueryHandler(bot_instance.handle_buy_rod, pattern="^buy_rod_"))
     application.add_handler(CallbackQueryHandler(bot_instance.handle_buy_net, pattern="^buy_net_"))
     application.add_handler(CallbackQueryHandler(bot_instance.handle_buy_feeder_coins, pattern="^buy_feeder_coins_"))
