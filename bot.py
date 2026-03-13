@@ -112,6 +112,7 @@ STAR_EMOJI_TAG = '<tg-emoji emoji-id="5463289097336405244">⭐</tg-emoji>'
 LOCATION_EMOJI_TAG = '<tg-emoji emoji-id="5821128296217185461">📍</tg-emoji>'
 PARTY_EMOJI_TAG = '<tg-emoji emoji-id="5436040291507247633">🎉</tg-emoji>'
 DIAMOND_EMOJI_TAG = '<tg-emoji emoji-id="5347855243556129844">💎</tg-emoji>'
+TG_EMOJI_TAG_RE = re.compile(r'<tg-emoji\s+emoji-id="[^"]+">(.*?)</tg-emoji>')
 
 def replace_coin_emoji(text: str) -> str:
     if not text:
@@ -133,6 +134,11 @@ def replace_coin_emoji(text: str) -> str:
         .replace("💎", DIAMOND_EMOJI_TAG)
         .replace("💍", DIAMOND_EMOJI_TAG)
     )
+
+def strip_tg_emoji_tags(text: str) -> str:
+    if not text or '<tg-emoji' not in text:
+        return text
+    return TG_EMOJI_TAG_RE.sub(r'\1', text)
 
 
 class EmojiBot(ExtBot):
@@ -171,15 +177,57 @@ class EmojiBot(ExtBot):
         if last_exc is not None:
             raise last_exc
 
+    @staticmethod
+    def _should_retry_without_custom_emoji(exc: Exception, text: str) -> bool:
+        if not text or '<tg-emoji' not in text:
+            return False
+        error_text = str(exc).lower()
+        return any(fragment in error_text for fragment in (
+            'document_invalid',
+            'can\'t parse entities',
+            'cant parse entities',
+            'unsupported start tag',
+            'custom emoji',
+            'entity',
+        ))
+
+    async def _send_with_custom_emoji_fallback(self, method_name: str, sender, *args, **kwargs):
+        converted_kwargs = dict(kwargs)
+        original_text = converted_kwargs.get('text')
+        if isinstance(original_text, str):
+            converted_kwargs['text'] = replace_coin_emoji(original_text)
+
+        try:
+            return await self._call_with_timeout(method_name, lambda: sender(*args, **converted_kwargs))
+        except BadRequest as exc:
+            converted_text = converted_kwargs.get('text')
+            if not isinstance(converted_text, str) or not self._should_retry_without_custom_emoji(exc, converted_text):
+                raise
+
+            fallback_kwargs = dict(converted_kwargs)
+            fallback_kwargs['text'] = strip_tg_emoji_tags(converted_text)
+            logger.warning(
+                "EmojiBot.%s rejected custom emoji markup, retrying with plain Unicode: %s",
+                method_name,
+                exc,
+            )
+            return await self._call_with_timeout(method_name, lambda: sender(*args, **fallback_kwargs))
+
     async def send_message(self, *args, **kwargs):
-        if 'text' in kwargs:
-            kwargs['text'] = replace_coin_emoji(kwargs['text'])
-        return await self._call_with_timeout("send_message", lambda: super(EmojiBot, self).send_message(*args, **kwargs))
+        return await self._send_with_custom_emoji_fallback(
+            "send_message",
+            super(EmojiBot, self).send_message,
+            *args,
+            **kwargs,
+        )
 
     async def edit_message_text(self, *args, **kwargs):
-        if 'text' in kwargs:
-            kwargs['text'] = replace_coin_emoji(kwargs['text'])
-        return await self._call_with_timeout("edit_message_text", lambda: super(EmojiBot, self).edit_message_text(*args, **kwargs))
+        return await self._send_with_custom_emoji_fallback(
+            "edit_message_text",
+            super(EmojiBot, self).edit_message_text,
+            *args,
+            **kwargs,
+        )
 
     async def send_document(self, *args, **kwargs):
         return await self._call_with_timeout("send_document", lambda: super(EmojiBot, self).send_document(*args, **kwargs))
