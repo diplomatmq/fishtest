@@ -114,6 +114,38 @@ PARTY_EMOJI_TAG = '<tg-emoji emoji-id="5436040291507247633">🎉</tg-emoji>'
 DIAMOND_EMOJI_TAG = '<tg-emoji emoji-id="5427168083074628963">💎</tg-emoji>'
 TG_EMOJI_TAG_RE = re.compile(r'<tg-emoji\s+emoji-id="[^"]+">(.*?)</tg-emoji>')
 
+# Booster catalog used by the feeders/echosounder shop.
+FEEDER_ITEMS = [
+    {
+        "code": "feeder_3",
+        "name": "Кормашка базовая",
+        "bonus": 3,
+        "duration_minutes": 60,
+        "price_coins": 3000,
+        "price_stars": 0,
+    },
+    {
+        "code": "feeder_7",
+        "name": "Кормушка усиленная",
+        "bonus": 5,
+        "duration_minutes": 60,
+        "price_coins": 5000,
+        "price_stars": 0,
+    },
+    {
+        "code": "feeder_10",
+        "name": "Кормушка звёздная",
+        "bonus": 7,
+        "duration_minutes": 60,
+        "price_coins": 0,
+        "price_stars": 10,
+    },
+]
+
+ECHOSOUNDER_CODE = "echosounder"
+ECHOSOUNDER_COST_STARS = 10
+ECHOSOUNDER_DURATION_HOURS = 24
+
 def _replace_plain_emoji_segment(text: str) -> str:
     if not text:
         return text
@@ -955,6 +987,13 @@ class FishBot:
             return None
 
     def _get_feeder_by_code(self, feeder_code: str) -> Optional[Dict[str, Any]]:
+        legacy_aliases = {
+            "feeder_basic": "feeder_3",
+            "feeder_pro": "feeder_7",
+            "feeder_premium": "feeder_10",
+            "feeder_5": "feeder_7",
+        }
+        feeder_code = legacy_aliases.get(feeder_code, feeder_code)
         for item in FEEDER_ITEMS:
             if item["code"] == feeder_code:
                 return item
