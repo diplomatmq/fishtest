@@ -2824,6 +2824,19 @@ class Database:
                     UNIQUE(user_id, chat_id)
                 )
             ''')
+
+            # Legacy-safe schema patching: old deployments may already have these
+            # tables but with missing columns.
+            cursor.execute("ALTER TABLE player_feeders ADD COLUMN IF NOT EXISTS chat_id BIGINT DEFAULT 0")
+            cursor.execute("ALTER TABLE player_feeders ADD COLUMN IF NOT EXISTS feeder_type TEXT")
+            cursor.execute("ALTER TABLE player_feeders ADD COLUMN IF NOT EXISTS bonus_percent INTEGER DEFAULT 0")
+            cursor.execute("ALTER TABLE player_feeders ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP")
+
+            cursor.execute("ALTER TABLE player_echosounder ADD COLUMN IF NOT EXISTS chat_id BIGINT DEFAULT 0")
+            cursor.execute("ALTER TABLE player_echosounder ADD COLUMN IF NOT EXISTS expires_at TIMESTAMP")
+
+            # Normalize nullable chat_id for global echosounder mode.
+            cursor.execute("UPDATE player_echosounder SET chat_id = 0 WHERE chat_id IS NULL")
             conn.commit()
 
     def get_active_feeder(self, user_id: int, chat_id: int) -> Optional[Dict[str, Any]]:
