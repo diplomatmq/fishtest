@@ -1925,6 +1925,10 @@ class Database:
 
         import random
         return random.choices(fish_list, weights=weights)[0]
+
+    def get_fish_for_location(self, location: str, season: str = "Лето", min_level: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Совместимость со старым API game_logic: вернуть рыбу по локации."""
+        return self.get_fish_by_location(location, season, min_level=min_level)
     
     def add_caught_fish(self, user_id: int, chat_id: int, fish_name: str, weight: float, location: str, length: float = 0):
         """Добавить пойманную рыбу"""
@@ -2761,6 +2765,139 @@ class Database:
                     continue
 
         return 0
+
+    def _ensure_booster_tables(self):
+        """Создать таблицы бустеров (кормушки/эхолот), если их еще нет."""
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS player_feeders (
+                    id INTEGER PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    chat_id BIGINT DEFAULT 0,
+                    feeder_type TEXT NOT NULL,
+                    bonus_percent INTEGER NOT NULL,
+                    expires_at TIMESTAMP NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id, chat_id)
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS player_echosounder (
+                    id INTEGER PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    chat_id BIGINT DEFAULT 0,
+                    expires_at TIMESTAMP NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id, chat_id)
+                )
+            ''')
+            conn.commit()
+
+    def get_active_feeder(self, user_id: int, chat_id: int) -> Optional[Dict[str, Any]]:
+        """Вернуть активную кормушку пользователя для чата (или глобальную)."""
+        self._ensure_booster_tables()
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                '''
+                SELECT user_id, chat_id, feeder_type, bonus_percent, expires_at
+                FROM player_feeders
+                WHERE user_id = ?
+                  AND (chat_id = ? OR chat_id IS NULL OR chat_id < 1)
+                  AND expires_at > CURRENT_TIMESTAMP
+                ORDER BY expires_at DESC
+                LIMIT 1
+                ''',
+                (user_id, chat_id),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            cols = [d[0] for d in cursor.description]
+            return dict(zip(cols, row))
+
+    def get_feeder_cooldown_remaining(self, user_id: int, chat_id: int) -> int:
+        """Вернуть оставшееся время активной кормушки в секундах."""
+        self._ensure_booster_tables()
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                '''
+                SELECT COALESCE(EXTRACT(EPOCH FROM (expires_at - CURRENT_TIMESTAMP)), 0)
+                FROM player_feeders
+                WHERE user_id = ?
+                  AND (chat_id = ? OR chat_id IS NULL OR chat_id < 1)
+                  AND expires_at > CURRENT_TIMESTAMP
+                ORDER BY expires_at DESC
+                LIMIT 1
+                ''',
+                (user_id, chat_id),
+            )
+            row = cursor.fetchone()
+            if not row or row[0] is None:
+                return 0
+            return max(0, int(row[0]))
+
+    def activate_feeder(self, user_id: int, chat_id: int, feeder_type: str, bonus_percent: int, duration_minutes: int):
+        """Активировать кормушку для пользователя в текущем чате."""
+        self._ensure_booster_tables()
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                '''
+                INSERT INTO player_feeders (user_id, chat_id, feeder_type, bonus_percent, expires_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP + (? || ' minutes')::interval)
+                ON CONFLICT (user_id, chat_id) DO UPDATE SET
+                    feeder_type = EXCLUDED.feeder_type,
+                    bonus_percent = EXCLUDED.bonus_percent,
+                    expires_at = EXCLUDED.expires_at
+                ''',
+                (user_id, chat_id, feeder_type, int(bonus_percent), int(duration_minutes)),
+            )
+            conn.commit()
+
+    def get_echosounder_remaining_seconds(self, user_id: int, chat_id: int) -> int:
+        """Вернуть оставшееся время эхолота (глобально на пользователя) в секундах."""
+        self._ensure_booster_tables()
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                '''
+                SELECT COALESCE(EXTRACT(EPOCH FROM (expires_at - CURRENT_TIMESTAMP)), 0)
+                FROM player_echosounder
+                WHERE user_id = ?
+                  AND chat_id = 0
+                  AND expires_at > CURRENT_TIMESTAMP
+                ORDER BY expires_at DESC
+                LIMIT 1
+                ''',
+                (user_id,),
+            )
+            row = cursor.fetchone()
+            if not row or row[0] is None:
+                return 0
+            return max(0, int(row[0]))
+
+    def is_echosounder_active(self, user_id: int, chat_id: int) -> bool:
+        """Проверить, активен ли эхолот у пользователя."""
+        return self.get_echosounder_remaining_seconds(user_id, chat_id) > 0
+
+    def activate_echosounder(self, user_id: int, chat_id: int, duration_hours: int):
+        """Активировать эхолот (глобально на пользователя, независимо от чата)."""
+        self._ensure_booster_tables()
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                '''
+                INSERT INTO player_echosounder (user_id, chat_id, expires_at)
+                VALUES (?, 0, CURRENT_TIMESTAMP + (? || ' hours')::interval)
+                ON CONFLICT (user_id, chat_id) DO UPDATE SET
+                    expires_at = EXCLUDED.expires_at
+                ''',
+                (user_id, int(duration_hours)),
+            )
+            conn.commit()
     
     def get_bait_count(self, user_id: int, bait_name: str) -> int:
         """Получить количество наживки у игрока"""
