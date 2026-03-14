@@ -3813,6 +3813,7 @@ class FishBot:
             [InlineKeyboardButton("🪱 Наживки", callback_data=f"shop_baits_{user_id}")],
             [InlineKeyboardButton("🕸️ Сети", callback_data=f"shop_nets_{user_id}")],
             [InlineKeyboardButton("🧺 Кормушки и эхолот", callback_data=f"shop_feeders_{user_id}")],
+            [InlineKeyboardButton("💎 Обменник", callback_data=f"shop_exchange_{user_id}")],
             [InlineKeyboardButton("🔙 Назад", callback_data=f"back_to_menu_{user_id}")]
         ]
         
@@ -3947,8 +3948,13 @@ class FishBot:
             return
 
         # Получаем количество бриллиантов и монет
-        diamonds = player.get('diamonds', 0)
+        diamonds = int(player.get('diamonds') or 0)
         coins = player.get('coins', 0)
+        treasures = db.get_player_treasures(user_id, chat_id)
+
+        treasure_counts = {t.get('treasure_name', ''): int(t.get('quantity', 0) or 0) for t in treasures}
+        shells_count = treasure_counts.get('Ракушка', 0)
+        pearls_count = treasure_counts.get('Жемчуг', 0)
 
         keyboard = [
             [InlineKeyboardButton(
@@ -3959,18 +3965,31 @@ class FishBot:
                 "💎 Продать бриллиант (250k монет)", 
                 callback_data=f"exchange_sell_diamond_{user_id}"
             )],
+            [InlineKeyboardButton(
+                "🐚 x10 -> 💎 Жемчуг x1",
+                callback_data=f"exchange_shell_to_pearl_{user_id}"
+            )],
+            [InlineKeyboardButton(
+                "💎 Жемчуг x100 -> Бриллиант x1",
+                callback_data=f"exchange_pearl_to_diamond_{user_id}"
+            )],
             [InlineKeyboardButton("🔙 Магазин", callback_data=f"shop_{user_id}")]
         ]
 
         message = f"""
 💎 Обменник драгоценностей
 
-💰 Ваш баланс: {coins} 🪙
+Ваши ресурсы:
+💰 Монеты: {coins:,} 🪙
 💎 Бриллианты: {diamonds}
+🐚 Ракушка: {shells_count}
+🦪 Жемчуг: {pearls_count}
 
 📊 Курсы обмена:
 💎 1 Бриллиант = 500,000 монет (покупка)
 💎 1 Бриллиант = 250,000 монет (продажа)
+🐚 10 Ракушек = 1 Жемчуг
+🦪 100 Жемчуга = 1 Бриллиант
 
 Выберите операцию:
         """
@@ -3996,13 +4015,18 @@ class FishBot:
 
         coins = player.get('coins', 0)
 
+        back_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 К обменнику", callback_data=f"shop_exchange_{user_id}")]
+        ])
+
         if coins < DIAMOND_BUY_PRICE:
             needed = DIAMOND_BUY_PRICE - coins
             await query.edit_message_text(
                 f"❌ Недостаточно монет\n\n"
                 f"Нужно: {DIAMOND_BUY_PRICE:,} 🪙\n"
                 f"У вас: {coins:,} 🪙\n"
-                f"Не хватает: {needed:,} 🪙"
+                f"Не хватает: {needed:,} 🪙",
+                reply_markup=back_keyboard
             )
             return
 
@@ -4018,7 +4042,8 @@ class FishBot:
             f"Потрачено: {DIAMOND_BUY_PRICE:,} 🪙\n"
             f"Получено: 1 💎\n\n"
             f"💰 Новый баланс: {new_coins:,} 🪙\n"
-            f"💎 Бриллианты: {new_diamonds}"
+            f"💎 Бриллианты: {new_diamonds}",
+            reply_markup=back_keyboard
         )
 
     async def handle_exchange_sell_diamond(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4039,9 +4064,15 @@ class FishBot:
             return
 
         diamonds = player.get('diamonds', 0)
+        back_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 К обменнику", callback_data=f"shop_exchange_{user_id}")]
+        ])
 
         if diamonds <= 0:
-            await query.edit_message_text("❌ У вас нет бриллиантов для продажи.")
+            await query.edit_message_text(
+                "❌ У вас нет бриллиантов для продажи.",
+                reply_markup=back_keyboard
+            )
             return
 
         # Добавляем монеты и вычитаем бриллиант
@@ -4057,7 +4088,92 @@ class FishBot:
             f"Получено: {DIAMOND_SELL_PRICE:,} 🪙\n"
             f"Продано: 1 💎\n\n"
             f"💰 Новый баланс: {new_coins:,} 🪙\n"
-            f"💎 Бриллианты: {new_diamonds}"
+            f"💎 Бриллианты: {new_diamonds}",
+            reply_markup=back_keyboard
+        )
+
+    async def handle_exchange_shell_to_pearl(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обмен 10 ракушек на 1 жемчуг"""
+        query = update.callback_query
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+
+        if not query.data.endswith(f"_{user_id}"):
+            await query.answer("Эта кнопка не для вас", show_alert=True)
+            return
+
+        await query.answer()
+
+        back_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 К обменнику", callback_data=f"shop_exchange_{user_id}")]
+        ])
+
+        treasures = db.get_player_treasures(user_id, chat_id)
+        shells = 0
+        for t in treasures:
+            if t.get('treasure_name') == 'Ракушка':
+                shells = int(t.get('quantity', 0) or 0)
+                break
+
+        if shells < 10:
+            await query.edit_message_text(
+                f"❌ Недостаточно ракушек\n\n"
+                f"Нужно: 10 🐚\n"
+                f"У вас: {shells} 🐚",
+                reply_markup=back_keyboard
+            )
+            return
+
+        db.remove_treasure(user_id, chat_id, 'Ракушка', 10)
+        db.add_treasure(user_id, 'Жемчуг', 1, chat_id)
+
+        await query.edit_message_text(
+            f"✅ Обмен выполнен!\n\n"
+            f"Списано: 10 🐚 Ракушка\n"
+            f"Получено: 1 🦪 Жемчуг",
+            reply_markup=back_keyboard
+        )
+
+    async def handle_exchange_pearl_to_diamond(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обмен 100 жемчуга на 1 бриллиант"""
+        query = update.callback_query
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+
+        if not query.data.endswith(f"_{user_id}"):
+            await query.answer("Эта кнопка не для вас", show_alert=True)
+            return
+
+        await query.answer()
+
+        back_keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 К обменнику", callback_data=f"shop_exchange_{user_id}")]
+        ])
+
+        treasures = db.get_player_treasures(user_id, chat_id)
+        pearls = 0
+        for t in treasures:
+            if t.get('treasure_name') == 'Жемчуг':
+                pearls = int(t.get('quantity', 0) or 0)
+                break
+
+        if pearls < 100:
+            await query.edit_message_text(
+                f"❌ Недостаточно жемчуга\n\n"
+                f"Нужно: 100 🦪\n"
+                f"У вас: {pearls} 🦪",
+                reply_markup=back_keyboard
+            )
+            return
+
+        db.remove_treasure(user_id, chat_id, 'Жемчуг', 100)
+        db.add_diamonds(user_id, chat_id, 1)
+
+        await query.edit_message_text(
+            f"✅ Обмен выполнен!\n\n"
+            f"Списано: 100 🦪 Жемчуг\n"
+            f"Получено: 1 💎 Бриллиант",
+            reply_markup=back_keyboard
         )
     
     async def handle_sell_fish(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7044,6 +7160,11 @@ def main():
     application.add_handler(CallbackQueryHandler(bot_instance.handle_shop_baits, pattern="^shop_baits_"))
     application.add_handler(CallbackQueryHandler(bot_instance.handle_shop_nets, pattern="^shop_nets_"))
     application.add_handler(CallbackQueryHandler(bot_instance.handle_shop_feeders, pattern="^shop_feeders_"))
+    application.add_handler(CallbackQueryHandler(bot_instance.handle_shop_exchange, pattern="^shop_exchange_"))
+    application.add_handler(CallbackQueryHandler(bot_instance.handle_exchange_buy_diamond, pattern="^exchange_buy_diamond_"))
+    application.add_handler(CallbackQueryHandler(bot_instance.handle_exchange_sell_diamond, pattern="^exchange_sell_diamond_"))
+    application.add_handler(CallbackQueryHandler(bot_instance.handle_exchange_shell_to_pearl, pattern="^exchange_shell_to_pearl_"))
+    application.add_handler(CallbackQueryHandler(bot_instance.handle_exchange_pearl_to_diamond, pattern="^exchange_pearl_to_diamond_"))
     application.add_handler(CallbackQueryHandler(bot_instance.handle_buy_rod, pattern="^buy_rod_"))
     application.add_handler(CallbackQueryHandler(bot_instance.handle_buy_net, pattern="^buy_net_"))
     application.add_handler(CallbackQueryHandler(bot_instance.handle_buy_feeder_coins, pattern="^buy_feeder_coins_"))
