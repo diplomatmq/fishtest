@@ -2718,6 +2718,7 @@ class FishBot:
         # Вытаскиваем случайные рыбы и мусор
         catch_results = []
         total_value = 0
+        net_treasure_totals: Dict[str, int] = {}
         feeder_bonus = db.get_active_feeder_bonus(user_id, chat_id)
         fish_chance = min(95, 80 + feeder_bonus)
         
@@ -2747,6 +2748,15 @@ class FishBot:
                     'price': trash['price']
                 })
                 total_value += trash['price']
+
+                treasure_key = self._roll_treasure_after_trash(
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    source_tag="NET",
+                    roll_index=i + 1,
+                )
+                if treasure_key:
+                    net_treasure_totals[treasure_key] = int(net_treasure_totals.get(treasure_key, 0) or 0) + 1
             elif available_fish:
                 # Ловим рыбу — с весами по редкости (легенда/миф бьётся реже)
                 _RARITY_WEIGHTS = {
@@ -2804,6 +2814,12 @@ class FishBot:
         
         message += "─" * 30 + "\n"
         message += f"💰 Итого: {total_value} {COIN_NAME}\n"
+        if net_treasure_totals:
+            from treasures import get_treasure_name
+
+            message += "💎 Драгоценности:\n"
+            for key, qty in sorted(net_treasure_totals.items(), key=lambda item: item[0]):
+                message += f"• {get_treasure_name(key)} x{qty}\n"
         if feeder_bonus > 0:
             message += f"🧺 Бонус кормушки: +{feeder_bonus}% (рыба {fish_chance}%)\n"
         
@@ -5348,6 +5364,57 @@ class FishBot:
         pool = same_rarity if same_rarity else available_fish
         return random.choice(pool) if pool else None
 
+    def _roll_treasure_after_trash(self, user_id: int, chat_id: int, source_tag: str, roll_index: Optional[int] = None) -> Optional[str]:
+        """Second roll after trash: returns treasure key or None."""
+        from treasures import TREASURES
+
+        total_probability = sum(float(t.get('probability', 0) or 0) for t in TREASURES.values())
+        treasure_roll = random.uniform(0, 100)
+        accumulated_probability = 0.0
+
+        logger.info(
+            "[%s] treasure_roll#2 start roll=%.2f/100 total_treasure_prob=%.2f%% no_treasure_prob=%.2f%% roll_index=%s",
+            source_tag,
+            treasure_roll,
+            total_probability,
+            max(0.0, 100.0 - total_probability),
+            roll_index,
+        )
+
+        for treasure_key, treasure_info in TREASURES.items():
+            chance = float(treasure_info.get('probability', 0) or 0)
+            prev_threshold = accumulated_probability
+            accumulated_probability += chance
+            logger.info(
+                "[%s] treasure_roll#2 check item=%s chance=%.2f%% range=(%.2f..%.2f] roll_index=%s",
+                source_tag,
+                treasure_key,
+                chance,
+                prev_threshold,
+                accumulated_probability,
+                roll_index,
+            )
+            if treasure_roll <= accumulated_probability:
+                db.add_treasure(user_id, treasure_key, 1, chat_id)
+                logger.info(
+                    "[%s] treasure_roll#2 result TREASURE item=%s roll=%.2f threshold=%.2f roll_index=%s",
+                    source_tag,
+                    treasure_key,
+                    treasure_roll,
+                    accumulated_probability,
+                    roll_index,
+                )
+                return treasure_key
+
+        logger.info(
+            "[%s] treasure_roll#2 result NONE roll=%.2f > total_treasure_prob=%.2f roll_index=%s",
+            source_tag,
+            treasure_roll,
+            accumulated_probability,
+            roll_index,
+        )
+        return None
+
     async def _execute_dynamite_blast(self, user_id: int, chat_id: int, guaranteed: bool = False, reply_to_message_id: Optional[int] = None) -> None:
         player = db.get_player(user_id, chat_id)
         if not player:
@@ -5399,6 +5466,8 @@ class FishBot:
         fail_count = 0
         total_trash_coins = 0
         total_haul_coins = 0
+        treasure_count = 0
+        treasure_totals: Dict[str, int] = {}
         pending_catches: List[Dict[str, Any]] = []
 
         for idx in range(1, DYNAMITE_BATCH_ROLLS + 1):
@@ -5448,10 +5517,18 @@ class FishBot:
                         trash.get('weight', 0),
                         trash_price,
                     )
-                    logger.info(
-                        "[DYNAMITE] roll=%s treasure_roll=SKIPPED reason=dynamite_has_no_second_treasure_roll",
-                        idx,
+                    treasure_key = self._roll_treasure_after_trash(
+                        user_id=user_id,
+                        chat_id=chat_id,
+                        source_tag="DYNAMITE",
+                        roll_index=idx,
                     )
+                    if treasure_key:
+                        from treasures import get_treasure_name
+
+                        treasure_count += 1
+                        treasure_totals[treasure_key] = int(treasure_totals.get(treasure_key, 0) or 0) + 1
+                        result_lines.append(f"   + {get_treasure_name(treasure_key)}")
                 else:
                     fail_count += 1
                     result_lines.append(f"{idx}. Срыв")
@@ -5551,12 +5628,13 @@ class FishBot:
             )
 
         logger.info(
-            "[DYNAMITE] finish user=%s chat=%s fish=%s trash=%s fail=%s catches_saved=%s total_trash_coins=%s total_haul_coins=%s",
+            "[DYNAMITE] finish user=%s chat=%s fish=%s trash=%s fail=%s treasures=%s catches_saved=%s total_trash_coins=%s total_haul_coins=%s",
             user_id,
             chat_id,
             fish_count,
             trash_count,
             fail_count,
+            treasure_count,
             len(pending_catches),
             total_trash_coins,
             total_haul_coins,
@@ -5580,10 +5658,20 @@ class FishBot:
             f"🎯 Результатов: {DYNAMITE_BATCH_ROLLS}\n"
             f"🐟 Рыбы: {fish_count}\n"
             f"📦 Мусор: {trash_count}\n"
+            f"💎 Драгоценности: {treasure_count}\n"
             f"❌ Срывы: {fail_count}\n"
             f"💰 Монеты за весь улов: +{total_haul_coins} {COIN_NAME}\n\n"
             + "\n".join(result_lines)
         )
+
+        if treasure_totals:
+            from treasures import get_treasure_name
+
+            treasure_lines = [
+                f"{get_treasure_name(key)} x{qty}"
+                for key, qty in sorted(treasure_totals.items(), key=lambda item: item[0])
+            ]
+            message += "\n\n💎 Итог по драгоценностям:\n" + "\n".join(treasure_lines)
 
         await self._safe_send_sticker(
             chat_id=chat_id,
@@ -7766,4 +7854,4 @@ def main():
         return
 
 if __name__ == '__main__':
-    main()
+    main() 
