@@ -4,50 +4,50 @@
 TREASURES = {
     "Ракушка": {
         "probability": 10.0,        # 10%
-        "sell_price": 10,           # монеты при продаже
-        "sell_xp": 1,               # опыт при продаже
+        "sell_price": 250,          # монеты при продаже
+        "sell_xp": 5,               # опыт при продаже
         "display_name": "🐚 Ракушка"
     },
     "Жемчуг": {
         "probability": 0.5,         # 0.5%
-        "sell_price": 200,
-        "sell_xp": 10,
+        "sell_price": 3000,
+        "sell_xp": 60,
         "display_name": "💎 Жемчуг"
     },
     "Кристалл": {
         "probability": 1.5,         # 1.5%
-        "sell_price": 100,
-        "sell_xp": 5,
+        "sell_price": 1800,
+        "sell_xp": 35,
         "display_name": "✨ Кристалл"
     },
     "Трезубец Посейдона": {
         "probability": 0.2,         # 0.2%
-        "sell_price": 1000,
-        "sell_xp": 50,
+        "sell_price": 25000,
+        "sell_xp": 400,
         "display_name": "⚜️ Трезубец Посейдона"
     },
     "Золотой нож": {
         "probability": 0.8,         # 0.8%
-        "sell_price": 400,
-        "sell_xp": 20,
+        "sell_price": 7000,
+        "sell_xp": 120,
         "display_name": "🔪 Золотой нож"
     },
     "Золотое кольцо": {
         "probability": 1.0,         # 1%
-        "sell_price": 300,
-        "sell_xp": 15,
+        "sell_price": 5500,
+        "sell_xp": 95,
         "display_name": "💍 Золотое кольцо"
     },
     "Браслет": {
         "probability": 0.7,         # 0.7%
-        "sell_price": 250,
-        "sell_xp": 12,
+        "sell_price": 5000,
+        "sell_xp": 85,
         "display_name": "✨ Браслет"
     },
     "Подвеска": {
         "probability": 1.2,         # 1.2%
-        "sell_price": 150,
-        "sell_xp": 8,
+        "sell_price": 4000,
+        "sell_xp": 70,
         "display_name": "🔮 Подвеска"
     },
 }
