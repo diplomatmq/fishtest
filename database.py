@@ -2,7 +2,7 @@ import os
 import logging
 import random
 from typing import Any, Dict, List, Optional, Union
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -474,6 +474,8 @@ class Database:
                     current_bait TEXT DEFAULT 'Черви',
                     current_location TEXT DEFAULT 'Городской пруд',
                     last_fish_time TEXT,
+                    last_dynamite_use_time TEXT,
+                    dynamite_ban_until TEXT,
                     is_banned INTEGER DEFAULT 0,
                     ban_until TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -896,6 +898,9 @@ class Database:
             ensure_column('players', 'consecutive_casts_at_location', 'INTEGER DEFAULT 0')
             ensure_column('players', 'last_fishing_location', 'TEXT')
             ensure_column('players', 'population_penalty', 'REAL DEFAULT 0.0')
+            ensure_column('players', 'penalty_recovery_casts', 'INTEGER DEFAULT 0')
+            ensure_column('players', 'last_dynamite_use_time', 'TEXT')
+            ensure_column('players', 'dynamite_ban_until', 'TEXT')
 
             # Ensure unique index for ON CONFLICT targets that expect (user_id, chat_id)
             try:
@@ -1827,7 +1832,7 @@ class Database:
         # Allow only specific fields to be updated to avoid SQL injection
         allowed_fields = {
             'username', 'coins', 'stars', 'xp', 'level', 'current_rod', 'current_bait',
-            'current_location', 'last_fish_time', 'is_banned', 'ban_until', 'ref', 'ref_link', 'last_net_use_time'
+            'current_location', 'last_fish_time', 'last_dynamite_use_time', 'dynamite_ban_until', 'is_banned', 'ban_until', 'ref', 'ref_link', 'last_net_use_time'
         }
 
         # Prevent passing chat_id as a kwarg (it is a positional arg here)
@@ -3738,6 +3743,81 @@ class Database:
             )
             conn.commit()
 
+    def get_dynamite_cooldown_remaining(self, user_id: int, chat_id: int, cooldown_hours: int = 8) -> int:
+        """Получить оставшееся время КД динамита в секундах."""
+        player = self.get_player(user_id, chat_id)
+        if not player:
+            return 0
+
+        last_use_raw = player.get('last_dynamite_use_time')
+        if not last_use_raw:
+            return 0
+
+        from datetime import datetime, timedelta, timezone
+        try:
+            last_use = datetime.fromisoformat(str(last_use_raw))
+        except Exception:
+            return 0
+
+        if last_use.tzinfo is None:
+            last_use = last_use.replace(tzinfo=timezone.utc)
+
+        cooldown_end = last_use + timedelta(hours=cooldown_hours)
+        now = datetime.now(timezone.utc)
+        if now >= cooldown_end:
+            return 0
+        return int((cooldown_end - now).total_seconds())
+
+    def reset_dynamite_cooldown(self, user_id: int) -> None:
+        """Сбросить КД динамита игрока."""
+        with self._connect() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'UPDATE players SET last_dynamite_use_time = NULL WHERE user_id = %s',
+                (user_id,)
+            )
+            conn.commit()
+
+    def get_dynamite_ban_remaining(self, user_id: int, chat_id: int) -> int:
+        """Оставшееся время ареста рыбохраной для динамита (в секундах)."""
+        player = self.get_player(user_id, chat_id)
+        if not player:
+            return 0
+
+        ban_until_raw = player.get('dynamite_ban_until')
+        if not ban_until_raw:
+            return 0
+
+        from datetime import datetime, timezone
+        try:
+            ban_until = datetime.fromisoformat(str(ban_until_raw))
+        except Exception:
+            return 0
+
+        if ban_until.tzinfo is None:
+            ban_until = ban_until.replace(tzinfo=timezone.utc)
+
+        now = datetime.now(timezone.utc)
+        if now >= ban_until:
+            # Авто-снятие просроченного ареста
+            try:
+                self.update_player(user_id, chat_id, dynamite_ban_until=None)
+            except Exception:
+                pass
+            return 0
+
+        return int((ban_until - now).total_seconds())
+
+    def set_dynamite_ban(self, user_id: int, chat_id: int, hours: int = 24) -> None:
+        """Установить арест рыбохраной для динамита."""
+        from datetime import datetime, timedelta
+        ban_until = (datetime.now() + timedelta(hours=hours)).isoformat()
+        self.update_player(user_id, chat_id, dynamite_ban_until=ban_until)
+
+    def clear_dynamite_ban(self, user_id: int, chat_id: int) -> None:
+        """Снять арест рыбохраны для динамита."""
+        self.update_player(user_id, chat_id, dynamite_ban_until=None)
+
     # ===== РЕФЕРАЛЬНАЯ СИСТЕМА =====
     
     def set_player_ref(self, user_id: int, chat_id: int, ref_user_id: int) -> bool:
@@ -3893,6 +3973,9 @@ class Database:
         """
         Обновить состояние популяции рыб на локации.
         Отслеживает, сколько раз подряд игрок ловит на одной локации.
+        Логика снятия штрафа:
+        - если не ловить 60+ минут, штраф сбрасывается;
+        - при смене локации штраф не снимается сразу: нужно 10 забросов на новой локации.
         Возвращает (location_changed, consecutive_casts, show_warning)
         """
         with self._connect() as conn:
@@ -3900,7 +3983,7 @@ class Database:
             
             # Получаем текущее состояние игрока
             cursor.execute('''
-                SELECT consecutive_casts_at_location, last_fishing_location, population_penalty
+                SELECT consecutive_casts_at_location, last_fishing_location, population_penalty, last_fish_time, penalty_recovery_casts
                 FROM players
                 WHERE user_id = %s AND chat_id = -1
             ''', (user_id,))
@@ -3911,42 +3994,67 @@ class Database:
                 location_changed = True
                 consecutive_casts = 1
                 population_penalty = 0.0
+                recovery_casts = 0
             else:
-                last_casts, last_location, population_penalty = row
+                last_casts, last_location, population_penalty, last_fish_time, recovery_casts = row
                 last_casts = last_casts or 0
                 population_penalty = population_penalty or 0.0
+                recovery_casts = recovery_casts or 0
+
+                # Таймер простоя: 60+ минут без ловли полностью снимает штраф и серию.
+                if last_fish_time:
+                    try:
+                        last_dt = datetime.fromisoformat(str(last_fish_time))
+                        now_dt = datetime.now(last_dt.tzinfo) if last_dt.tzinfo else datetime.now()
+                        if now_dt - last_dt >= timedelta(minutes=60):
+                            last_casts = 0
+                            population_penalty = 0.0
+                            recovery_casts = 0
+                    except Exception:
+                        # Если время в нестандартном формате, продолжаем без таймера простоя.
+                        pass
                 
                 # Проверяем, изменилась ли локация
                 location_changed = (last_location != current_location)
                 
                 if location_changed:
-                    # Игрок переместился на новую локацию
+                    # Игрок переместился на новую локацию.
+                    # Если есть штраф - он переносится, и снимается только после 10 забросов на новой локации.
                     consecutive_casts = 1
-                    population_penalty = 0.0  # Штраф сбрасывается при смене локации
+                    recovery_casts = 1 if population_penalty > 0 else 0
                 else:
                     # Остался на той же локации
                     consecutive_casts = last_casts + 1
-                    
-                    # Рассчитываем штраф на основе количества забросов
-                    if consecutive_casts >= 60:
-                        population_penalty = 15.0
-                    elif consecutive_casts >= 50:
-                        population_penalty = 11.0
-                    elif consecutive_casts >= 40:
-                        population_penalty = 8.0
-                    elif consecutive_casts >= 30:
-                        population_penalty = 5.0
-                    else:
-                        population_penalty = 0.0
+
+                    # Режим восстановления штрафа после смены локации.
+                    if recovery_casts > 0 and population_penalty > 0:
+                        recovery_casts += 1
+                        if recovery_casts >= 10:
+                            population_penalty = 0.0
+                            recovery_casts = 0
+
+                    # Обычная шкала штрафов действует, только когда нет восстановления.
+                    if recovery_casts == 0:
+                        if consecutive_casts >= 60:
+                            population_penalty = 15.0
+                        elif consecutive_casts >= 50:
+                            population_penalty = 11.0
+                        elif consecutive_casts >= 40:
+                            population_penalty = 8.0
+                        elif consecutive_casts >= 30:
+                            population_penalty = 5.0
+                        else:
+                            population_penalty = 0.0
             
             # Обновляем состояние в базе
             cursor.execute('''
                 UPDATE players
                 SET consecutive_casts_at_location = %s,
                     last_fishing_location = %s,
-                    population_penalty = %s
+                    population_penalty = %s,
+                    penalty_recovery_casts = %s
                 WHERE user_id = %s AND chat_id = -1
-            ''', (consecutive_casts, current_location, population_penalty, user_id))
+            ''', (consecutive_casts, current_location, population_penalty, recovery_casts, user_id))
             conn.commit()
             
             # show_warning если достигли 30 забросов
