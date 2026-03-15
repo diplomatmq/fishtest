@@ -404,19 +404,45 @@ class FishingGame:
                 total_probability = sum(t['probability'] for t in TREASURES.values())
                 treasure_roll = random.uniform(0, 100)
                 accumulated_probability = 0
-                
-                logger.info(f"   💎 Treasure roll: {treasure_roll:.2f}% (total prob: {total_probability:.2f}%)")
+
+                logger.info(
+                    "   💎 Treasure roll #2 start: roll=%.2f/100, total_treasure_prob=%.2f%%, no_treasure_prob=%.2f%%",
+                    treasure_roll,
+                    total_probability,
+                    max(0.0, 100.0 - total_probability),
+                )
                 
                 for treasure_key, treasure_info in TREASURES.items():
-                    accumulated_probability += treasure_info['probability']
+                    chance = float(treasure_info.get('probability', 0) or 0)
+                    prev_threshold = accumulated_probability
+                    accumulated_probability += chance
+                    logger.info(
+                        "   💎 Treasure roll #2 check: item=%s chance=%.2f%% range=(%.2f..%.2f]",
+                        treasure_key,
+                        chance,
+                        prev_threshold,
+                        accumulated_probability,
+                    )
                     if treasure_roll <= accumulated_probability:
                         treasure_caught = treasure_info
                         treasure_name = treasure_key
-                        logger.info(f"   💎 Treasure caught: {treasure_key} ({treasure_info['probability']}%)")
+                        logger.info(
+                            "   💎 Treasure roll #2 result: TREASURE item=%s roll=%.2f threshold=%.2f",
+                            treasure_key,
+                            treasure_roll,
+                            accumulated_probability,
+                        )
                         
                         # Добавляем драгоценность игроку
                         db.add_treasure(user_id, treasure_key, 1, chat_id)
                         break
+
+                if treasure_name is None:
+                    logger.info(
+                        "   💎 Treasure roll #2 result: NONE roll=%.2f > total_treasure_prob=%.2f",
+                        treasure_roll,
+                        accumulated_probability,
+                    )
                 
                 return {
                     "success": False,
@@ -736,19 +762,45 @@ class FishingGame:
                 total_probability = sum(t['probability'] for t in TREASURES.values())
                 treasure_roll = random.uniform(0, 100)
                 accumulated_probability = 0
-                
-                logger.info(f"   💎 Treasure roll: {treasure_roll:.2f}% (total prob: {total_probability:.2f}%)")
+
+                logger.info(
+                    "   💎 Treasure roll #2 start: roll=%.2f/100, total_treasure_prob=%.2f%%, no_treasure_prob=%.2f%%",
+                    treasure_roll,
+                    total_probability,
+                    max(0.0, 100.0 - total_probability),
+                )
                 
                 for treasure_key, treasure_info in TREASURES.items():
-                    accumulated_probability += treasure_info['probability']
+                    chance = float(treasure_info.get('probability', 0) or 0)
+                    prev_threshold = accumulated_probability
+                    accumulated_probability += chance
+                    logger.info(
+                        "   💎 Treasure roll #2 check: item=%s chance=%.2f%% range=(%.2f..%.2f]",
+                        treasure_key,
+                        chance,
+                        prev_threshold,
+                        accumulated_probability,
+                    )
                     if treasure_roll <= accumulated_probability:
                         treasure_caught = treasure_info
                         treasure_name = treasure_key
-                        logger.info(f"   💎 Treasure caught: {treasure_key} ({treasure_info['probability']}%)")
+                        logger.info(
+                            "   💎 Treasure roll #2 result: TREASURE item=%s roll=%.2f threshold=%.2f",
+                            treasure_key,
+                            treasure_roll,
+                            accumulated_probability,
+                        )
                         
                         # Добавляем драгоценность игроку
                         db.add_treasure(user_id, treasure_key, 1, chat_id)
                         break
+
+                if treasure_name is None:
+                    logger.info(
+                        "   💎 Treasure roll #2 result: NONE roll=%.2f > total_treasure_prob=%.2f",
+                        treasure_roll,
+                        accumulated_probability,
+                    )
 
                 return {
                     "success": False,
