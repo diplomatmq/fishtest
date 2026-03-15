@@ -39,7 +39,7 @@ from database import db, DB_PATH, BAMBOO_ROD, TEMP_ROD_RANGES
 
 # --- TelegramBotAPI for invoice link creation ---
 import httpx
-from typing import Any, Optional, Dict
+from typing import Any, Optional, Dict, List
 
 class TelegramBotAPI:
     def __init__(self, bot_token: str) -> None:
@@ -145,6 +145,13 @@ FEEDER_ITEMS = [
 ECHOSOUNDER_CODE = "echosounder"
 ECHOSOUNDER_COST_STARS = 20
 ECHOSOUNDER_DURATION_HOURS = 24
+
+DYNAMITE_COOLDOWN_HOURS = 8
+DYNAMITE_BATCH_ROLLS = 12
+DYNAMITE_SKIP_COST_STARS = 15
+DYNAMITE_GUARD_CHANCE = 0.001
+DYNAMITE_GUARD_BAN_HOURS = 24
+DYNAMITE_GUARD_FINE_STARS = 20
 
 def _replace_plain_emoji_segment(text: str) -> str:
     if not text:
@@ -966,6 +973,50 @@ class FishBot:
     def _build_booster_payload(self, booster_code: str, user_id: int, chat_id: int) -> str:
         return f"booster_{booster_code}_{user_id}_{chat_id}_{int(datetime.now().timestamp())}"
 
+    def _build_dynamite_skip_payload(self, user_id: int, chat_id: int) -> str:
+        return f"dynamite_skip_cd_{user_id}_{chat_id}_{int(datetime.now().timestamp())}"
+
+    def _parse_dynamite_skip_payload(self, payload: str) -> Optional[Dict[str, int]]:
+        if not payload or not payload.startswith("dynamite_skip_cd_"):
+            return None
+
+        body = payload[len("dynamite_skip_cd_"):]
+        parts = body.rsplit("_", 2)
+        if len(parts) != 3:
+            return None
+
+        user_part, chat_part, ts_part = parts
+        try:
+            return {
+                "payload_user_id": int(user_part),
+                "group_chat_id": int(chat_part),
+                "created_ts": int(ts_part),
+            }
+        except (TypeError, ValueError):
+            return None
+
+    def _build_dynamite_fine_payload(self, user_id: int, chat_id: int) -> str:
+        return f"dynamite_fine_{user_id}_{chat_id}_{int(datetime.now().timestamp())}"
+
+    def _parse_dynamite_fine_payload(self, payload: str) -> Optional[Dict[str, int]]:
+        if not payload or not payload.startswith("dynamite_fine_"):
+            return None
+
+        body = payload[len("dynamite_fine_"):]
+        parts = body.rsplit("_", 2)
+        if len(parts) != 3:
+            return None
+
+        user_part, chat_part, ts_part = parts
+        try:
+            return {
+                "payload_user_id": int(user_part),
+                "group_chat_id": int(chat_part),
+                "created_ts": int(ts_part),
+            }
+        except (TypeError, ValueError):
+            return None
+
     def _parse_booster_payload(self, payload: str) -> Optional[Dict[str, Any]]:
         if not payload or not payload.startswith("booster_"):
             return None
@@ -1630,7 +1681,10 @@ class FishBot:
                     "Рыба испугалась и её осталось мало в этом месте.\n\n"
                     "🗺️ <b>Смените локацию!</b>\n"
                     "Используйте /menu для выбора другого места.\n\n"
-                    "Если вы не смените локацию или не будете ловить 60 минут, шансы будут падать:\n"
+                    "Как снять штраф:\n"
+                    "• Не ловить 60 минут\n"
+                    "• Или сменить локацию и сделать 10 забросов на новой\n\n"
+                    "Если продолжите ловить на одной локации, шансы будут падать:\n"
                     "• 30 забросов: -5%\n"
                     "• 40 забросов: -8%\n"
                     "• 50 забросов: -11%\n"
@@ -5146,6 +5200,7 @@ class FishBot:
 /menu - меню рыбалки
 /fish - начать рыбалку
 /net - использовать сеть
+/dynamite - взорвать динамит (12 роллов)
 /shop - магазин
 /weather - погода на локации
 /stats - ваша статистика
@@ -5216,6 +5271,266 @@ class FishBot:
         reply_markup = InlineKeyboardMarkup(keyboard)
         message = f"🕸️ Выберите сеть для использования:\n\n📍 Локация: {player['current_location']}"
         await update.message.reply_text(message, reply_markup=reply_markup)
+
+    def _pick_dynamite_fish(self, location: str, season: str, player_level: int, target_rarity: str) -> Optional[Dict[str, Any]]:
+        available_fish = db.get_fish_by_location(location, season, min_level=player_level)
+        if not available_fish:
+            return None
+        same_rarity = [f for f in available_fish if f.get('rarity') == target_rarity]
+        pool = same_rarity if same_rarity else available_fish
+        return random.choice(pool) if pool else None
+
+    async def _execute_dynamite_blast(self, user_id: int, chat_id: int, guaranteed: bool = False, reply_to_message_id: Optional[int] = None) -> None:
+        player = db.get_player(user_id, chat_id)
+        if not player:
+            await self._safe_send_message(
+                chat_id=chat_id,
+                text="❌ Профиль не найден. Используйте /start в этом чате.",
+                reply_to_message_id=reply_to_message_id,
+            )
+            return
+
+        location = player.get('current_location', 'Городской пруд')
+        season = get_current_season()
+        player_level = int(player.get('level') or 0)
+        weather = db.get_or_update_weather(location)
+        weather_bonus = weather_system.get_weather_bonus(weather['condition']) if weather else 0
+        feeder_bonus = db.get_active_feeder_bonus(user_id, chat_id)
+        population_penalty = db.get_population_penalty(user_id)
+
+        if guaranteed:
+            roll_max = 20000
+            trash_max = 7999
+            common_max = 16999
+            rare_max = 18999
+            legendary_max = 19899
+        else:
+            roll_max = 15000
+            no_bite_max = 3749
+            trash_max = 7499
+            common_max = 11999
+            rare_max = 14849
+            legendary_max = 14997
+
+        result_lines: List[str] = []
+        fish_count = 0
+        trash_count = 0
+        fail_count = 0
+        total_trash_coins = 0
+        pending_catches: List[Dict[str, Any]] = []
+
+        for idx in range(1, DYNAMITE_BATCH_ROLLS + 1):
+            roll = random.randint(0, roll_max)
+            adjusted_roll = roll + (weather_bonus * 50) + (feeder_bonus * 250)
+            adjusted_roll = max(0, min(roll_max, adjusted_roll))
+
+            penalty_points = int((population_penalty / 100) * roll_max)
+            adjusted_roll = max(0, adjusted_roll - penalty_points)
+
+            if not guaranteed and adjusted_roll <= no_bite_max:
+                fail_count += 1
+                result_lines.append(f"{idx}. Срыв")
+                continue
+
+            if adjusted_roll <= trash_max:
+                trash = db.get_random_trash(location)
+                if trash:
+                    trash_name = trash.get('name', 'Мусор')
+                    trash_price = int(trash.get('price', 0) or 0)
+                    pending_catches.append({
+                        'name': trash_name,
+                        'weight': float(trash.get('weight', 0) or 0),
+                        'length': 0.0,
+                    })
+                    total_trash_coins += trash_price
+                    trash_count += 1
+                    result_lines.append(f"{idx}. {trash_name}")
+                else:
+                    fail_count += 1
+                    result_lines.append(f"{idx}. Срыв")
+                continue
+
+            if adjusted_roll <= common_max:
+                target_rarity = "Обычная"
+            elif adjusted_roll <= rare_max:
+                target_rarity = "Редкая"
+            elif adjusted_roll <= legendary_max:
+                target_rarity = "Легендарная"
+            else:
+                # Для динамита NFT отключен: верхний ролл тоже считается мификом.
+                target_rarity = "Мифическая"
+
+            fish = self._pick_dynamite_fish(location, season, player_level, target_rarity)
+            if not fish:
+                fail_count += 1
+                result_lines.append(f"{idx}. Срыв")
+                continue
+
+            weight = round(random.uniform(float(fish['min_weight']), float(fish['max_weight'])), 2)
+            length = round(random.uniform(float(fish['min_length']), float(fish['max_length'])), 1)
+            pending_catches.append({
+                'name': fish['name'],
+                'weight': weight,
+                'length': length,
+            })
+            fish_count += 1
+            result_lines.append(f"{idx}. {format_fish_name(fish['name'])}")
+
+        # Очень редкая отдельная механика для динамита: рыбохрана.
+        if random.random() < DYNAMITE_GUARD_CHANCE:
+            db.set_dynamite_ban(user_id, chat_id, DYNAMITE_GUARD_BAN_HOURS)
+
+            sticker_path = Path(__file__).parent / "fishdef.webp"
+            if sticker_path.exists():
+                try:
+                    with open(sticker_path, 'rb') as f:
+                        await self._safe_send_document(
+                            chat_id=chat_id,
+                            document=f,
+                            reply_to_message_id=reply_to_message_id,
+                        )
+                except Exception as e:
+                    logger.warning("Could not send fishdef.webp on dynamite arrest: %s", e)
+
+            await self._safe_send_message(
+                chat_id=chat_id,
+                text=(
+                    "🚨 Вас поймала рыбохрана при использовании динамита!\n"
+                    "Весь текущий улов конфискован.\n"
+                    f"⛔ Динамит арестован на {DYNAMITE_GUARD_BAN_HOURS} часа.\n"
+                    f"💫 Откуп: {DYNAMITE_GUARD_FINE_STARS} {STAR_NAME}."
+                ),
+                reply_to_message_id=reply_to_message_id,
+            )
+            return
+
+        for item in pending_catches:
+            db.add_caught_fish(
+                user_id,
+                chat_id,
+                item['name'],
+                float(item['weight']),
+                location,
+                float(item['length']),
+            )
+
+        new_coins = int(player.get('coins', 0) or 0) + total_trash_coins
+        db.update_player(
+            user_id,
+            chat_id,
+            coins=new_coins,
+            last_dynamite_use_time=datetime.now().isoformat(),
+        )
+
+        header = "🧨 <b>Вы взорвали динамит!</b>"
+        if guaranteed:
+            header += "\n⭐ Гарантированный динамит"
+
+        message = (
+            f"{header}\n\n"
+            f"📍 Локация: {location}\n"
+            f"🎯 Результатов: {DYNAMITE_BATCH_ROLLS}\n"
+            f"🐟 Рыбы: {fish_count}\n"
+            f"📦 Мусор: {trash_count}\n"
+            f"❌ Срывы: {fail_count}\n"
+            f"💰 Монеты за мусор: +{total_trash_coins} {COIN_NAME}\n"
+            f"💼 Баланс: {new_coins} {COIN_NAME}\n\n"
+            + "\n".join(result_lines)
+        )
+
+        await self._safe_send_message(
+            chat_id=chat_id,
+            text=message,
+            reply_to_message_id=reply_to_message_id,
+        )
+
+    async def dynamite_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда/слово динамит: 12 независимых роллов с КД 8 часов."""
+        if update.effective_chat.type == 'private':
+            await update.message.reply_text("Команда динамита работает только в группах.")
+            return
+
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+        player = db.get_player(user_id, chat_id)
+
+        if not player:
+            await update.message.reply_text("Сначала создайте профиль командой /start")
+            return
+
+        ban_remaining = db.get_dynamite_ban_remaining(user_id, chat_id)
+        if ban_remaining > 0:
+            hours = ban_remaining // 3600
+            minutes = (ban_remaining % 3600) // 60
+            seconds = ban_remaining % 60
+            ban_text = f"{hours}ч {minutes}м {seconds}с" if hours > 0 else f"{minutes}м {seconds}с"
+
+            tg_api = TelegramBotAPI(BOT_TOKEN)
+            payload = self._build_dynamite_fine_payload(user_id, chat_id)
+            invoice_url = await tg_api.create_invoice_link(
+                title="Выкуп у рыбохраны",
+                description=f"Снять арест динамита ({DYNAMITE_GUARD_FINE_STARS} {STAR_NAME})",
+                payload=payload,
+                currency="XTR",
+                prices=[{"label": "Выкуп динамита", "amount": DYNAMITE_GUARD_FINE_STARS}],
+            )
+
+            if not invoice_url:
+                await update.message.reply_text(
+                    f"⛔ Вас арестовала рыбохрана. До снятия ареста: {ban_text}.\n"
+                    "❌ Не удалось создать ссылку оплаты. Попробуйте позже."
+                )
+                return
+
+            await self.send_invoice_url_button(
+                chat_id=chat_id,
+                invoice_url=invoice_url,
+                text=(
+                    f"⛔ Вас арестовала рыбохрана. До снятия ареста: {ban_text}.\n\n"
+                    f"⭐ Оплатите {DYNAMITE_GUARD_FINE_STARS} Telegram Stars, чтобы снять арест с динамита."
+                ),
+                user_id=user_id,
+                reply_to_message_id=update.effective_message.message_id if update.effective_message else None,
+            )
+            return
+
+        remaining = db.get_dynamite_cooldown_remaining(user_id, chat_id, DYNAMITE_COOLDOWN_HOURS)
+        if remaining > 0:
+            hours = remaining // 3600
+            minutes = (remaining % 3600) // 60
+            seconds = remaining % 60
+            cooldown_text = f"{hours}ч {minutes}м {seconds}с" if hours > 0 else f"{minutes}м {seconds}с"
+
+            tg_api = TelegramBotAPI(BOT_TOKEN)
+            payload = self._build_dynamite_skip_payload(user_id, chat_id)
+            invoice_url = await tg_api.create_invoice_link(
+                title="Гарантированный динамит",
+                description=f"Мгновенный взрыв динамита без ожидания ({DYNAMITE_SKIP_COST_STARS} {STAR_NAME})",
+                payload=payload,
+                currency="XTR",
+                prices=[{"label": "Гарантированный динамит", "amount": DYNAMITE_SKIP_COST_STARS}],
+            )
+
+            if not invoice_url:
+                await update.message.reply_text(
+                    f"⏳ Динамит на перезарядке: {cooldown_text}\n"
+                    "❌ Не удалось создать ссылку оплаты. Попробуйте позже."
+                )
+                return
+
+            await self.send_invoice_url_button(
+                chat_id=chat_id,
+                invoice_url=invoice_url,
+                text=(
+                    f"⏳ Динамит на перезарядке: {cooldown_text}\n\n"
+                    f"⭐ Оплатите {DYNAMITE_SKIP_COST_STARS} Telegram Stars для гарантированного взрыва динамита прямо сейчас."
+                ),
+                user_id=user_id,
+                reply_to_message_id=update.effective_message.message_id if update.effective_message else None,
+            )
+            return
+
+        await self._execute_dynamite_blast(user_id, chat_id, guaranteed=False, reply_to_message_id=update.effective_message.message_id if update.effective_message else None)
     
     async def handle_fish_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обработка сообщения 'рыбалка' и других текстовых сообщений"""
@@ -5407,6 +5722,9 @@ class FishBot:
             return
         if re.match(r"^\s*сеть\b", message_text):
             await self.net_command(update, context)
+            return
+        if re.match(r"^\s*(динамит|диномит|dynamite)\b", message_text):
+            await self.dynamite_command(update, context)
             return
     
     async def weather_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5904,6 +6222,40 @@ class FishBot:
             except (ValueError, IndexError):
                 await query.answer(ok=False, error_message="Инвойс устарел. Запросите новый.")
                 return
+        elif payload.startswith("dynamite_skip_cd_"):
+            parsed_dynamite = self._parse_dynamite_skip_payload(payload)
+            if not parsed_dynamite:
+                await query.answer(ok=False, error_message="Инвойс динамита устарел. Запросите новый.")
+                return
+
+            if parsed_dynamite.get("payload_user_id") != user_id:
+                await query.answer(ok=False, error_message="Этот инвойс создан для другого пользователя.")
+                return
+
+            created_ts = parsed_dynamite.get("created_ts")
+            now_ts = int(datetime.now().timestamp())
+            if isinstance(created_ts, int) and now_ts - created_ts > 900:
+                await query.answer(ok=False, error_message="Срок действия инвойса истек. Запросите новый.")
+                return
+            payload_chat_id = int(parsed_dynamite.get("group_chat_id") or 0)
+            if payload_chat_id and db.get_dynamite_ban_remaining(user_id, payload_chat_id) > 0:
+                await query.answer(ok=False, error_message="Динамит под арестом рыбохраны. Сначала оплатите выкуп.")
+                return
+        elif payload.startswith("dynamite_fine_"):
+            parsed_dynamite_fine = self._parse_dynamite_fine_payload(payload)
+            if not parsed_dynamite_fine:
+                await query.answer(ok=False, error_message="Инвойс выкупа устарел. Запросите новый.")
+                return
+
+            if parsed_dynamite_fine.get("payload_user_id") != user_id:
+                await query.answer(ok=False, error_message="Этот инвойс создан для другого пользователя.")
+                return
+
+            created_ts = parsed_dynamite_fine.get("created_ts")
+            now_ts = int(datetime.now().timestamp())
+            if isinstance(created_ts, int) and now_ts - created_ts > 900:
+                await query.answer(ok=False, error_message="Срок действия инвойса истек. Запросите новый.")
+                return
         # Проверяем, не был ли этот инвойс уже оплачен
         if payload and payload in self.paid_payloads:
             await query.answer(ok=False, error_message="Этот инвойс уже был оплачен. Запросите новый.")
@@ -5935,6 +6287,8 @@ class FishBot:
         parsed_guaranteed_payload = None
         parsed_harpoon_payload = None
         parsed_booster_payload = None
+        parsed_dynamite_payload = None
+        parsed_dynamite_fine_payload = None
         if payload.startswith("guaranteed_"):
             parsed_guaranteed_payload = self._parse_guaranteed_payload(payload)
             if parsed_guaranteed_payload and parsed_guaranteed_payload.get("group_chat_id"):
@@ -5953,6 +6307,18 @@ class FishBot:
                 _parts = payload.split("_")
                 accounting_chat_id = int(_parts[4])
             except (ValueError, IndexError):
+                accounting_chat_id = active_invoice.get("group_chat_id") or chat_id
+        elif payload.startswith("dynamite_skip_cd_"):
+            parsed_dynamite_payload = self._parse_dynamite_skip_payload(payload)
+            if parsed_dynamite_payload and parsed_dynamite_payload.get("group_chat_id"):
+                accounting_chat_id = int(parsed_dynamite_payload["group_chat_id"])
+            else:
+                accounting_chat_id = active_invoice.get("group_chat_id") or chat_id
+        elif payload.startswith("dynamite_fine_"):
+            parsed_dynamite_fine_payload = self._parse_dynamite_fine_payload(payload)
+            if parsed_dynamite_fine_payload and parsed_dynamite_fine_payload.get("group_chat_id"):
+                accounting_chat_id = int(parsed_dynamite_fine_payload["group_chat_id"])
+            else:
                 accounting_chat_id = active_invoice.get("group_chat_id") or chat_id
         elif active_invoice.get("group_chat_id"):
             try:
@@ -6010,6 +6376,46 @@ class FishBot:
                 chat_id=accounting_chat_id,
                 text="✅ Кулдаун всех сетей сброшен! Используйте /net чтобы закинуть сети снова.",
                 reply_to_message_id=skip_reply_id,
+            )
+            return
+        elif payload and payload.startswith("dynamite_skip_cd_"):
+            if not parsed_dynamite_payload:
+                parsed_dynamite_payload = self._parse_dynamite_skip_payload(payload)
+
+            group_chat_id = accounting_chat_id
+            if parsed_dynamite_payload and parsed_dynamite_payload.get("group_chat_id"):
+                group_chat_id = int(parsed_dynamite_payload["group_chat_id"])
+
+            dynamite_reply_id = None
+            if user_id in self.active_invoices:
+                dynamite_reply_id = self.active_invoices[user_id].get('group_message_id')
+                del self.active_invoices[user_id]
+
+            await self._execute_dynamite_blast(
+                user_id=user_id,
+                chat_id=group_chat_id,
+                guaranteed=True,
+                reply_to_message_id=dynamite_reply_id,
+            )
+            return
+        elif payload and payload.startswith("dynamite_fine_"):
+            if not parsed_dynamite_fine_payload:
+                parsed_dynamite_fine_payload = self._parse_dynamite_fine_payload(payload)
+
+            group_chat_id = accounting_chat_id
+            if parsed_dynamite_fine_payload and parsed_dynamite_fine_payload.get("group_chat_id"):
+                group_chat_id = int(parsed_dynamite_fine_payload["group_chat_id"])
+
+            fine_reply_id = None
+            if user_id in self.active_invoices:
+                fine_reply_id = self.active_invoices[user_id].get('group_message_id')
+                del self.active_invoices[user_id]
+
+            db.clear_dynamite_ban(user_id, group_chat_id)
+            await self._safe_send_message(
+                chat_id=group_chat_id,
+                text="✅ Выкуп принят. Арест рыбохраны снят, динамит снова доступен.",
+                reply_to_message_id=fine_reply_id,
             )
             return
         elif payload and payload.startswith("repair_rod_"):
@@ -7084,6 +7490,7 @@ def main():
     application.add_handler(CommandHandler("menu", bot_instance.menu_command))
     application.add_handler(CommandHandler("shop", bot_instance.handle_shop))
     application.add_handler(CommandHandler("net", bot_instance.net_command))
+    application.add_handler(CommandHandler("dynamite", bot_instance.dynamite_command))
     application.add_handler(CommandHandler("weather", bot_instance.weather_command))
     application.add_handler(CommandHandler("testweather", bot_instance.test_weather_command))
     application.add_handler(CommandHandler("stats", bot_instance.stats_command))
