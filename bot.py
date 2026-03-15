@@ -5448,6 +5448,10 @@ class FishBot:
                         trash.get('weight', 0),
                         trash_price,
                     )
+                    logger.info(
+                        "[DYNAMITE] roll=%s treasure_roll=SKIPPED reason=dynamite_has_no_second_treasure_roll",
+                        idx,
+                    )
                 else:
                     fail_count += 1
                     result_lines.append(f"{idx}. Срыв")
