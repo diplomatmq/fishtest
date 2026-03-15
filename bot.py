@@ -152,6 +152,7 @@ DYNAMITE_SKIP_COST_STARS = 15
 DYNAMITE_GUARD_CHANCE = 0.001
 DYNAMITE_GUARD_BAN_HOURS = 24
 DYNAMITE_GUARD_FINE_STARS = 20
+DYNAMITE_STICKER_FILE_ID = "CAACAgEAAxkBAAEcHQlptoOhA4B-LV0g-vv7Orrwg4UZfgACXgIAAg60IEQze4zUaM3_bzoE"
 
 def _replace_plain_emoji_segment(text: str) -> str:
     if not text:
@@ -1226,6 +1227,24 @@ class FishBot:
         logger.error("_safe_send_document: failed after retries args=%s", kwargs)
         return None
 
+    async def _safe_send_sticker(self, **kwargs):
+        for attempt in range(3):
+            try:
+                return await self.application.bot.send_sticker(**kwargs)
+            except (BadRequest, Forbidden) as e:
+                logger.warning("_safe_send_sticker: non-retryable error (chat_id=%s): %s", kwargs.get('chat_id'), e)
+                return None
+            except RetryAfter as e:
+                wait = getattr(e, 'retry_after', None) or getattr(e, 'timeout', 1)
+                logger.warning("RetryAfter on send_sticker, waiting %s sec (attempt %s)", wait, attempt + 1)
+                await asyncio.sleep(float(wait) + 1)
+            except Exception as e:
+                logger.warning("_safe_send_sticker: unexpected error (chat_id=%s, attempt %s): %s", kwargs.get('chat_id'), attempt + 1, e)
+                if attempt >= 2:
+                    return None
+        logger.error("_safe_send_sticker: failed after retries args=%s", kwargs)
+        return None
+
     async def _safe_edit_message_text(self, **kwargs):
         for attempt in range(3):
             try:
@@ -1848,7 +1867,7 @@ class FishBot:
             rarity_emoji = {
                 'Обычная': '⚪',
                 'Редкая': '🔵',
-                'Легендарная': '🟣',
+                'Легендарная': '🟡',
                 'Мифическая': '🔴'
             }
             fish_name_display = format_fish_name(fish['name'])
@@ -3983,6 +4002,50 @@ class FishBot:
             await query.edit_message_text("✅ Удочка починена!")
         else:
             await query.edit_message_text("❌ Ошибка: профиль не найден!")
+
+    def _canonical_treasure_name(self, treasure_name: str) -> str:
+        """Normalize treasure name so exchange can combine legacy/variant labels."""
+        raw = (treasure_name or "").strip().lower()
+        # Keep only letters/spaces to ignore emoji/punctuation noise in old rows.
+        cleaned = re.sub(r"[^a-zа-яё\s]", "", raw, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+        if "ракуш" in cleaned or "shell" in cleaned:
+            return "Ракушка"
+        if "жемч" in cleaned or "pearl" in cleaned:
+            return "Жемчуг"
+        return treasure_name or ""
+
+    def _get_treasure_total(self, treasures: List[Dict[str, Any]], canonical_name: str) -> int:
+        total = 0
+        for item in treasures:
+            name = item.get('treasure_name', '')
+            qty = int(item.get('quantity', 0) or 0)
+            if qty > 0 and self._canonical_treasure_name(name) == canonical_name:
+                total += qty
+        return total
+
+    def _consume_treasure_total(self, user_id: int, chat_id: int, treasures: List[Dict[str, Any]], canonical_name: str, amount: int) -> int:
+        """Remove amount from matching treasure variants. Returns removed quantity."""
+        remaining = int(amount)
+        removed = 0
+        for item in treasures:
+            if remaining <= 0:
+                break
+
+            name = item.get('treasure_name', '')
+            qty = int(item.get('quantity', 0) or 0)
+            if qty <= 0:
+                continue
+            if self._canonical_treasure_name(name) != canonical_name:
+                continue
+
+            take = min(qty, remaining)
+            db.remove_treasure(user_id, chat_id, name, take)
+            remaining -= take
+            removed += take
+
+        return removed
     
     async def handle_shop_exchange(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Обменник драгоценностей и монет"""
@@ -4006,9 +4069,8 @@ class FishBot:
         coins = player.get('coins', 0)
         treasures = db.get_player_treasures(user_id, chat_id)
 
-        treasure_counts = {t.get('treasure_name', ''): int(t.get('quantity', 0) or 0) for t in treasures}
-        shells_count = treasure_counts.get('Ракушка', 0)
-        pearls_count = treasure_counts.get('Жемчуг', 0)
+        shells_count = self._get_treasure_total(treasures, 'Ракушка')
+        pearls_count = self._get_treasure_total(treasures, 'Жемчуг')
 
         keyboard = [
             [InlineKeyboardButton(
@@ -4163,11 +4225,7 @@ class FishBot:
         ])
 
         treasures = db.get_player_treasures(user_id, chat_id)
-        shells = 0
-        for t in treasures:
-            if t.get('treasure_name') == 'Ракушка':
-                shells = int(t.get('quantity', 0) or 0)
-                break
+        shells = self._get_treasure_total(treasures, 'Ракушка')
 
         if shells < 10:
             await query.edit_message_text(
@@ -4178,7 +4236,14 @@ class FishBot:
             )
             return
 
-        db.remove_treasure(user_id, chat_id, 'Ракушка', 10)
+        removed_shells = self._consume_treasure_total(user_id, chat_id, treasures, 'Ракушка', 10)
+        if removed_shells < 10:
+            await query.edit_message_text(
+                "❌ Не удалось списать нужное количество ракушек. Попробуйте снова.",
+                reply_markup=back_keyboard
+            )
+            return
+
         db.add_treasure(user_id, 'Жемчуг', 1, chat_id)
 
         await query.edit_message_text(
@@ -4205,11 +4270,7 @@ class FishBot:
         ])
 
         treasures = db.get_player_treasures(user_id, chat_id)
-        pearls = 0
-        for t in treasures:
-            if t.get('treasure_name') == 'Жемчуг':
-                pearls = int(t.get('quantity', 0) or 0)
-                break
+        pearls = self._get_treasure_total(treasures, 'Жемчуг')
 
         if pearls < 100:
             await query.edit_message_text(
@@ -4220,7 +4281,14 @@ class FishBot:
             )
             return
 
-        db.remove_treasure(user_id, chat_id, 'Жемчуг', 100)
+        removed_pearls = self._consume_treasure_total(user_id, chat_id, treasures, 'Жемчуг', 100)
+        if removed_pearls < 100:
+            await query.edit_message_text(
+                "❌ Не удалось списать нужное количество жемчуга. Попробуйте снова.",
+                reply_markup=back_keyboard
+            )
+            return
+
         db.add_diamonds(user_id, chat_id, 1)
 
         await query.edit_message_text(
@@ -4506,7 +4574,7 @@ class FishBot:
         rarity_emoji = {
             'Обычная': '⚪',
             'Редкая': '🔵',
-            'Легендарная': '🟣',
+            'Легендарная': '🟡',
             'Мифическая': '🔴'
         }
         for fish in page_fish:
@@ -5312,11 +5380,25 @@ class FishBot:
             rare_max = 14849
             legendary_max = 14997
 
+        logger.info(
+            "[DYNAMITE] start user=%s chat=%s location=%s guaranteed=%s season=%s level=%s weather_bonus=%+d feeder_bonus=%+d population_penalty=%.2f%%",
+            user_id,
+            chat_id,
+            location,
+            guaranteed,
+            season,
+            player_level,
+            weather_bonus,
+            feeder_bonus,
+            population_penalty,
+        )
+
         result_lines: List[str] = []
         fish_count = 0
         trash_count = 0
         fail_count = 0
         total_trash_coins = 0
+        total_haul_coins = 0
         pending_catches: List[Dict[str, Any]] = []
 
         for idx in range(1, DYNAMITE_BATCH_ROLLS + 1):
@@ -5327,9 +5409,22 @@ class FishBot:
             penalty_points = int((population_penalty / 100) * roll_max)
             adjusted_roll = max(0, adjusted_roll - penalty_points)
 
+            logger.info(
+                "[DYNAMITE] roll=%s raw=%s/%s weather_points=%+d feeder_points=%+d penalty_points=-%d adjusted=%s/%s",
+                idx,
+                roll,
+                roll_max,
+                weather_bonus * 50,
+                feeder_bonus * 250,
+                penalty_points,
+                adjusted_roll,
+                roll_max,
+            )
+
             if not guaranteed and adjusted_roll <= no_bite_max:
                 fail_count += 1
                 result_lines.append(f"{idx}. Срыв")
+                logger.info("[DYNAMITE] roll=%s branch=NO_BITE threshold<=%s", idx, no_bite_max)
                 continue
 
             if adjusted_roll <= trash_max:
@@ -5343,11 +5438,20 @@ class FishBot:
                         'length': 0.0,
                     })
                     total_trash_coins += trash_price
+                    total_haul_coins += trash_price
                     trash_count += 1
                     result_lines.append(f"{idx}. {trash_name}")
+                    logger.info(
+                        "[DYNAMITE] roll=%s branch=TRASH name=%s weight=%skg price=%s",
+                        idx,
+                        trash_name,
+                        trash.get('weight', 0),
+                        trash_price,
+                    )
                 else:
                     fail_count += 1
                     result_lines.append(f"{idx}. Срыв")
+                    logger.info("[DYNAMITE] roll=%s branch=TRASH but no trash in location -> NO_BITE", idx)
                 continue
 
             if adjusted_roll <= common_max:
@@ -5364,21 +5468,49 @@ class FishBot:
             if not fish:
                 fail_count += 1
                 result_lines.append(f"{idx}. Срыв")
+                logger.info("[DYNAMITE] roll=%s branch=FISH rarity=%s but pool empty -> NO_BITE", idx, target_rarity)
                 continue
 
             weight = round(random.uniform(float(fish['min_weight']), float(fish['max_weight'])), 2)
             length = round(random.uniform(float(fish['min_length']), float(fish['max_length'])), 1)
+            rarity_circle = {
+                'Обычная': '⚪',
+                'Редкая': '🔵',
+                'Легендарная': '🟡',
+                'Мифическая': '🔴',
+            }.get(target_rarity, '⚪')
             pending_catches.append({
                 'name': fish['name'],
                 'weight': weight,
                 'length': length,
             })
+            fish_value = int(db.calculate_fish_price(fish, weight, length))
+            total_haul_coins += fish_value
             fish_count += 1
-            result_lines.append(f"{idx}. {format_fish_name(fish['name'])}")
+            result_lines.append(
+                f"{idx}. {rarity_circle} {format_fish_name(fish['name'])} ({length} см, {weight} кг)"
+            )
+            logger.info(
+                "[DYNAMITE] roll=%s branch=FISH rarity=%s name=%s length=%scm weight=%skg price=%s",
+                idx,
+                target_rarity,
+                fish['name'],
+                length,
+                weight,
+                fish_value,
+            )
 
         # Очень редкая отдельная механика для динамита: рыбохрана.
         if random.random() < DYNAMITE_GUARD_CHANCE:
             db.set_dynamite_ban(user_id, chat_id, DYNAMITE_GUARD_BAN_HOURS)
+            logger.info(
+                "[DYNAMITE] guard_triggered user=%s chat=%s chance=%.4f ban_hours=%s catches_confiscated=%s",
+                user_id,
+                chat_id,
+                DYNAMITE_GUARD_CHANCE,
+                DYNAMITE_GUARD_BAN_HOURS,
+                len(pending_catches),
+            )
 
             sticker_path = Path(__file__).parent / "fishdef.webp"
             if sticker_path.exists():
@@ -5414,6 +5546,18 @@ class FishBot:
                 float(item['length']),
             )
 
+        logger.info(
+            "[DYNAMITE] finish user=%s chat=%s fish=%s trash=%s fail=%s catches_saved=%s total_trash_coins=%s total_haul_coins=%s",
+            user_id,
+            chat_id,
+            fish_count,
+            trash_count,
+            fail_count,
+            len(pending_catches),
+            total_trash_coins,
+            total_haul_coins,
+        )
+
         new_coins = int(player.get('coins', 0) or 0) + total_trash_coins
         db.update_player(
             user_id,
@@ -5433,9 +5577,14 @@ class FishBot:
             f"🐟 Рыбы: {fish_count}\n"
             f"📦 Мусор: {trash_count}\n"
             f"❌ Срывы: {fail_count}\n"
-            f"💰 Монеты за мусор: +{total_trash_coins} {COIN_NAME}\n"
-            f"💼 Баланс: {new_coins} {COIN_NAME}\n\n"
+            f"💰 Монеты за весь улов: +{total_haul_coins} {COIN_NAME}\n\n"
             + "\n".join(result_lines)
+        )
+
+        await self._safe_send_sticker(
+            chat_id=chat_id,
+            sticker=DYNAMITE_STICKER_FILE_ID,
+            reply_to_message_id=reply_to_message_id,
         )
 
         await self._safe_send_message(
@@ -5971,7 +6120,7 @@ class FishBot:
             rarity_emoji = {
                 'Обычная': '⚪',
                 'Редкая': '🔵',
-                'Легендарная': '🟣',
+                'Легендарная': '🟡',
                 'Мифическая': '🔴'
             }
             fish_name_display = format_fish_name(fish['name'])
